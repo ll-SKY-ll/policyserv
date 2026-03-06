@@ -39,9 +39,9 @@ func (f *ForbiddenUserIdFilter) MakeFor(set *Set) (Instanced, error) {
 		}
 	}
 
-	// Parse event types: "*" means all, otherwise a list of specific types.
+	// Parse event types: "*" or empty/unset means all, otherwise a list of specific types.
 	rawEventTypes := internal.Dereference(set.communityConfig.ForbiddenUserIdFilterEventTypes)
-	matchAllEventTypes := false
+	matchAllEventTypes := true
 	eventTypeSet := make(map[string]bool)
 	for _, t := range rawEventTypes {
 		trimmed := strings.TrimSpace(t)
@@ -50,6 +50,8 @@ func (f *ForbiddenUserIdFilter) MakeFor(set *Set) (Instanced, error) {
 			break
 		}
 		if len(trimmed) > 0 {
+			// If any specific types are listed, switch to explicit mode.
+			matchAllEventTypes = false
 			eventTypeSet[trimmed] = true
 		}
 	}
