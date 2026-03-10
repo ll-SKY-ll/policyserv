@@ -86,4 +86,7 @@ func TestFrequencyFilter(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1.0, vecs.GetVector(classification.Spam))
 	assert.Equal(t, 1.0, vecs.GetVector(classification.Frequency))
+
+	// Allow the goroutines to settle before concluding the test
+	time.Sleep(100 * time.Millisecond)
 }
