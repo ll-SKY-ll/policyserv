@@ -151,6 +151,9 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	if len(internal.Dereference(communityConfig.ForbiddenUserIdFilterPatterns)) > 0 {
 		filters = append(filters, filter.ForbiddenUserIdFilterName)
 	}
+	if internal.Dereference(communityConfig.MentionFrequencyFilterRateLimit) > 0 {
+		filters = append(filters, filter.MentionsFrequencyFilterName)
+	}
 	if len(internal.Dereference(communityConfig.FrequencyFilterEventTypes)) > 0 && internal.Dereference(communityConfig.FrequencyFilterRateLimit) > 0 {
 		filters = append(filters, filter.FrequencyFilterName)
 	}
