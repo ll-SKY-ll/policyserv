@@ -157,14 +157,33 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	if len(internal.Dereference(communityConfig.FrequencyFilterEventTypes)) > 0 && internal.Dereference(communityConfig.FrequencyFilterRateLimit) > 0 {
 		filters = append(filters, filter.FrequencyFilterName)
 	}
-	var scanner content.Scanner
+
+	var scanners []content.Scanner
+
+	// HMA hash-matching scanner (known CSAM hashes)
 	if m.instanceConfig.HMAApiUrl != "" && len(internal.Dereference(communityConfig.HMAFilterEnabledBanks)) > 0 {
-		filters = append(filters, filter.MediaScanningFilterName)
-		scanner, err = content.NewHMAScanner(m.instanceConfig.HMAApiUrl, m.instanceConfig.HMAApiKey, internal.Dereference(communityConfig.HMAFilterEnabledBanks))
+		hma, err := content.NewHMAScanner(m.instanceConfig.HMAApiUrl, m.instanceConfig.HMAApiKey, internal.Dereference(communityConfig.HMAFilterEnabledBanks))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HMA scanner: %w", err)
 		}
+		scanners = append(scanners, hma)
 	}
+
+	// Local AI image classification scanner (e.g. NSFW detection)
+	if m.instanceConfig.LocalAIScannerUrl != "" {
+		localAI, err := content.NewLocalAIScanner(m.instanceConfig.LocalAIScannerUrl, m.instanceConfig.LocalAIScannerNsfwThreshold)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create local AI scanner: %w", err)
+		}
+		scanners = append(scanners, localAI)
+	}
+
+	var scanner content.Scanner
+	if len(scanners) > 0 {
+		filters = append(filters, filter.MediaScanningFilterName)
+		scanner = content.NewMultiScanner(scanners...)
+	}
+
 	if communityConfig.UnsafeSigningKeyFilterEnabled {
 		prefilters = append(prefilters, filter.UnsafeSigningKeyFilterName)
 	}
