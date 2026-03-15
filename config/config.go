@@ -56,9 +56,10 @@ type InstanceConfig struct {
 	HMAApiUrl string `envconfig:"hma_api_url" default:""`
 	HMAApiKey string `envconfig:"hma_api_key" default:""`
 
-	// Local AI image scanner (e.g. NSFW ViT classifier sidecar)
-	LocalAIScannerUrl           string  `envconfig:"local_ai_scanner_url" default:""`
-	LocalAIScannerNsfwThreshold float64 `envconfig:"local_ai_scanner_nsfw_threshold" default:"0.70"`
+	// Local AI image scanners. Format: "type|url,type|url"
+	// e.g. "nsfw|http://127.0.0.1:5000,violence|http://127.0.0.1:5001"
+	// Communities opt in to specific scanner types via their config.
+	LocalAIScanners string `envconfig:"local_ai_scanners" default:""`
 
 	SupportAdminContacts    []SupportContact `envconfig:"support_admin_contacts" default:""`
 	SupportSecurityContacts []SupportContact `envconfig:"support_security_contacts" default:""`

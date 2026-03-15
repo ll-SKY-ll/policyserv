@@ -24,11 +24,23 @@ type Manager struct {
 	instanceConfig       *config.InstanceConfig
 	pubsubClient         pubsub.Client
 	auditQueue           *audit.Queue
+	localAIScannerDefs   []content.LocalAIScannerDef // parsed once at startup
 }
 
 func NewManager(instanceConfig *config.InstanceConfig, storage storage.PersistentStorage, pubsubClient pubsub.Client, auditQueue *audit.Queue) (*Manager, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+
+	// Parse local AI scanner definitions from instance config
+	scannerDefs, err := content.ParseLocalAIScannerDefs(instanceConfig.LocalAIScanners)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse local AI scanner definitions: %w", err)
+	}
+	if len(scannerDefs) > 0 {
+		for _, def := range scannerDefs {
+			log.Printf("Registered local AI scanner: type=%s url=%s", def.Type, def.Url)
+		}
+	}
 
 	filterCache := cache.New[string, *filter.Set]() // we don't use a janitor because the filters may need a proper shutdown
 	configCh, err := pubsubClient.Subscribe(ctx, pubsub.TopicCommunityConfig)
@@ -59,6 +71,7 @@ func NewManager(instanceConfig *config.InstanceConfig, storage storage.Persisten
 		instanceConfig:       instanceConfig,
 		pubsubClient:         pubsubClient,
 		auditQueue:           auditQueue,
+		localAIScannerDefs:   scannerDefs,
 	}, nil
 }
 
@@ -148,14 +161,14 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	if len(internal.Dereference(communityConfig.LinkFilterAllowedUrlGlobs)) > 0 || len(internal.Dereference(communityConfig.LinkFilterDeniedUrlGlobs)) > 0 {
 		filters = append(filters, filter.LinkFilterName)
 	}
-	if len(internal.Dereference(communityConfig.ForbiddenUserIdFilterPatterns)) > 0 {
-		filters = append(filters, filter.ForbiddenUserIdFilterName)
-	}
 	if internal.Dereference(communityConfig.MentionFrequencyFilterRateLimit) > 0 {
 		filters = append(filters, filter.MentionsFrequencyFilterName)
 	}
 	if len(internal.Dereference(communityConfig.FrequencyFilterEventTypes)) > 0 && internal.Dereference(communityConfig.FrequencyFilterRateLimit) > 0 {
 		filters = append(filters, filter.FrequencyFilterName)
+	}
+	if len(internal.Dereference(communityConfig.ForbiddenUserIdFilterPatterns)) > 0 {
+		filters = append(filters, filter.ForbiddenUserIdFilterName)
 	}
 
 	var scanners []content.Scanner
@@ -169,14 +182,27 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 		scanners = append(scanners, hma)
 	}
 
-	// Local AI image classification scanner (e.g. NSFW detection)
-	// Requires both the instance-level URL to be set AND the community to opt in
-	if m.instanceConfig.LocalAIScannerUrl != "" && internal.Dereference(communityConfig.LocalAIScannerEnabled) {
-		localAI, err := content.NewLocalAIScanner(m.instanceConfig.LocalAIScannerUrl, m.instanceConfig.LocalAIScannerNsfwThreshold)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create local AI scanner: %w", err)
+	// Local AI image scanners — match community-requested types against instance-available types
+	if communityConfig.LocalAIScannerConfigs != nil && len(*communityConfig.LocalAIScannerConfigs) > 0 {
+		// Build a lookup of available scanner URLs by type
+		availableScanners := make(map[string]string) // type -> url
+		for _, def := range m.localAIScannerDefs {
+			availableScanners[def.Type] = def.Url
 		}
-		scanners = append(scanners, localAI)
+
+		for _, commScanner := range *communityConfig.LocalAIScannerConfigs {
+			url, available := availableScanners[commScanner.Type]
+			if !available {
+				log.Printf("[%s] Community requested scanner type %q but it is not available at instance level, skipping", communityId, commScanner.Type)
+				continue
+			}
+			localAI, err := content.NewLocalAIScanner(commScanner.Type, url, commScanner.Threshold)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create local AI scanner type %q: %w", commScanner.Type, err)
+			}
+			log.Printf("[%s] Enabled local AI scanner: type=%s url=%s threshold=%.2f", communityId, commScanner.Type, url, commScanner.Threshold)
+			scanners = append(scanners, localAI)
+		}
 	}
 
 	var scanner content.Scanner

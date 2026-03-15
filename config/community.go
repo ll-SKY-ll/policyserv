@@ -50,7 +50,18 @@ type CommunityConfig struct {
 	UnsafeSigningKeyFilterEnabled            bool      `json:"unsafe_signing_key_filter_enabled,omitempty" envconfig:"unsafe_signing_key_filter_enabled" default:"true"`
 	FrequencyFilterEventTypes                *[]string `json:"frequency_filter_event_types,omitempty" envconfig:"frequency_filter_event_types" default:"m.room.message,m.sticker,m.reaction"`
 	FrequencyFilterRateLimit                 *float64  `json:"frequency_filter_rate_limit,omitempty" envconfig:"frequency_filter_rate_limit" default:"0"`
-	LocalAIScannerEnabled                    *bool     `json:"local_ai_scanner_enabled,omitempty" envconfig:"local_ai_scanner_enabled" default:"false"`
+
+	// Local AI scanner configs. Each entry enables a specific scanner type for this community
+	// with a custom threshold. The scanner type must match one defined at the instance level.
+	// Example: [{"type": "nsfw", "threshold": 0.70}, {"type": "violence", "threshold": 0.80}]
+	LocalAIScannerConfigs *[]LocalAIScannerCommunityEntry `json:"local_ai_scanner_configs,omitempty"`
+}
+
+// LocalAIScannerCommunityEntry is a single scanner type + threshold pair
+// configured at the community level.
+type LocalAIScannerCommunityEntry struct {
+	Type      string  `json:"type"`
+	Threshold float64 `json:"threshold"`
 }
 
 func (c *CommunityConfig) Clone() (*CommunityConfig, error) {
