@@ -47,9 +47,10 @@ type CommunityConfig struct {
 	ForbiddenUserIdFilterPatterns            *[]string `json:"forbidden_user_id_filter_patterns,omitempty" envconfig:"forbidden_user_id_filter_patterns" default:""`
 	ForbiddenUserIdFilterEventTypes          *[]string `json:"forbidden_user_id_filter_event_types,omitempty" envconfig:"forbidden_user_id_filter_event_types" default:""`
 	ForbiddenUserIdFilterAllowedUsers        *[]string `json:"forbidden_user_id_filter_allowed_users,omitempty" envconfig:"forbidden_user_id_filter_allowed_users" default:""`
- 	UnsafeSigningKeyFilterEnabled            bool      `json:"unsafe_signing_key_filter_enabled,omitempty" envconfig:"unsafe_signing_key_filter_enabled" default:"true"`
+	UnsafeSigningKeyFilterEnabled            bool      `json:"unsafe_signing_key_filter_enabled,omitempty" envconfig:"unsafe_signing_key_filter_enabled" default:"true"`
 	FrequencyFilterEventTypes                *[]string `json:"frequency_filter_event_types,omitempty" envconfig:"frequency_filter_event_types" default:"m.room.message,m.sticker,m.reaction"`
 	FrequencyFilterRateLimit                 *float64  `json:"frequency_filter_rate_limit,omitempty" envconfig:"frequency_filter_rate_limit" default:"0"`
+	LocalAIScannerEnabled                    *bool     `json:"local_ai_scanner_enabled,omitempty" envconfig:"local_ai_scanner_enabled" default:"false"`
 }
 
 func (c *CommunityConfig) Clone() (*CommunityConfig, error) {

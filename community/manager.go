@@ -170,7 +170,8 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	}
 
 	// Local AI image classification scanner (e.g. NSFW detection)
-	if m.instanceConfig.LocalAIScannerUrl != "" {
+	// Requires both the instance-level URL to be set AND the community to opt in
+	if m.instanceConfig.LocalAIScannerUrl != "" && internal.Dereference(communityConfig.LocalAIScannerEnabled) {
 		localAI, err := content.NewLocalAIScanner(m.instanceConfig.LocalAIScannerUrl, m.instanceConfig.LocalAIScannerNsfwThreshold)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create local AI scanner: %w", err)
