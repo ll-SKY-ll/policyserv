@@ -59,6 +59,7 @@ Everything else is optional, though may be useful for some deployments:
 * `PS_JOIN_SERVER` (default `matrix.org`) - The server to send the join event through.
 * `PS_JOIN_ROOM_IDS` (default empty value) - The room IDs to join to receive events in, and therefore protect. Removing a room from this list does *not* unprotect it. Rooms will become part of the `default` community.
 * `PS_JOIN_LOCALPART` (default `policyserv`) - The localpart for the user ID which joins the rooms.
+* `PS_EVENT_FETCH_SERVERS` (default `matrix.org`) - CSV list of server names to fetch missing events from. This is a relatively rare operation.
 * `PS_API_KEY` (default empty value) - The API key which enables use of the policyserv API. If set, this should be a random value and considered a password. If unset or empty, the API will not be enabled.
 * `PS_MODERATOR_ACCESS_TOKENS` (default empty value) - The access tokens and Client-Server API URL domains for those tokens used for moderation (redaction). Example: `matrix-client.matrix.org:syt_example,gnome.ems.host:syt_example2`
 * `PS_HTTP_PPROF_BIND` (default `0.0.0.0:8082` in Docker, empty value otherwise) - The address to bind the [pprof](https://pkg.go.dev/net/http/pprof) endpoints to. Not bound if an empty value. Recommended to be a local address (or not exposed by the container).
@@ -66,6 +67,8 @@ Everything else is optional, though may be useful for some deployments:
 * `PS_ALLOWED_WEBHOOK_DOMAINS` (default `element.ems.host`) - CSV list of the hostnames/domains policyserv is allowed to send webhooks to.
 * `PS_HOMESERVER_MEDIA_CLIENT_URL` (default `https://matrix-client.matrix.org`) - The client-server API URL to use for fetching media.
 * `PS_HOMESERVER_MEDIA_CLIENT_ACCESS_TOKEN` (default empty value) - The access token to use for fetching media on the above client-server API URL.
+* `PS_HOMESERVER_ALLOWED_NETWORKS` (default `0.0.0.0/0`) - The CSV-encoded CIDR ranges to allow list when making Federation API requests. Denies are checked before allows.
+* `PS_HOMESERVER_DENIED_NETWORKS` (default `127.0.0.1/8,10.0.0.0/8,172.16.0.0./12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16,::1/128,fe80::/64,fc00::/7`) - The CSV-encoded CIDR ranges to deny list when making Federation API requests. Denies are checked before allows.
 
 Support information can be supplied using the following environment variables. These are used to populate the [`/.well-known/matrix/support`](https://spec.matrix.org/v1.17/client-server-api/#getwell-knownmatrixsupport)
 endpoint, and may be used by clients to help communities get set up using your policyserv instance.
@@ -82,6 +85,7 @@ Some environment variables that can be set explicitly but shouldn't in most case
 * `PS_WEBHOOK_POOL_SIZE` (default `5`) - How many concurrent webhook notifications to process, roughly speaking.
 * `PS_HOMESERVER_SIGNING_KEY_PATH` (default `/data/signing.key` in Docker, `./signing.key` otherwise) - The path to the signing key generated above. Should not need changing in Docker.
 * `PS_HOMESERVER_EVENT_SIGNING_KEY_PATH` (default `/data/event_signing.key` in Docker, `./event_signing.key` otherwise) - The path to the signing key used to sign events, generated above. Should not need changing in Docker. Note: The Key Version (ID) of this key is not used.
+* `PS_FEDERATION_CATCHUP_INTERVAL_SECONDS` (default `15`) - How often to send previously-failed transactions to remote servers. Set to zero or negative to disable this feature. Disabling the feature should only be required for in-depth troubleshooting of policyserv because it may prevent remote servers from receiving federation traffic from policyserv. This should be set to a relatively small value to ensure speed of delivery to remote servers.
 
 Once you have your signing keys and an idea for your config, you can deploy policyserv using the Docker image mentioned 
 below. If you prefer to compile policyserv yourself, run `go build -o bin/policyserv ./cmd/app/...` and then run the 
@@ -119,6 +123,9 @@ server are trusted by the server administrator(s).
 * `PS_SPAM_THRESHOLD` (default `0.8`) - A value between 0 and 1 denoting how much "confidence" is needed before an event 
   is considered spammy. Note that policyserv can currently only generate scores of 0, 0.5, and 1 - a future version will 
   allow for more precise scores, so it's recommended to keep this value as a decimal.
+* `PS_MODERATION_BOT_USER_ID` (default empty value) - The user ID of the bot account where policyserv can send redaction
+  commands to. A device on the user *must* implement the [policyserv to-device protocol](./docs/to_device.md) for this to
+  work. Set to an empty value to disable this feature.
 
 ### Allowed senders prefilter
 
