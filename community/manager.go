@@ -179,6 +179,10 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	if len(internal.Dereference(communityConfig.ForbiddenUserIdFilterPatterns)) > 0 {
 		filters = append(filters, filter.ForbiddenUserIdFilterName)
 	}
+	if len(internal.Dereference(communityConfig.MutedRoomsFilterRoomIds)) > 0 {
+		// Deliberately a postfilter rather than a prefilter - see the developer note in filter_muted_rooms.go for why.
+		postfilters = append(postfilters, filter.MutedRoomsFilterName)
+	}
 
 	var scanners []content.Scanner
 

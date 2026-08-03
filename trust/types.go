@@ -6,6 +6,10 @@ type Capability string
 
 const CapabilityMedia Capability = "media"
 
+// CapabilitySpeak - The ability to send events to a room at all. Used by the muted rooms filter. Note that all
+// current sources grant every capability they know about, so this behaves identically to CapabilityMedia today.
+const CapabilitySpeak Capability = "speak"
+
 // Source - represents a source of trust. "Trust" is arbitrarily defined as a set of capabilities applied to users
 // in a room. This trust may be global, or it may be scoped to a community. Trust may also change over time.
 type Source interface {
