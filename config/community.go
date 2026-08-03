@@ -47,6 +47,10 @@ type CommunityConfig struct {
 	ForbiddenUserIdFilterPatterns            *[]string `json:"forbidden_user_id_filter_patterns,omitempty" envconfig:"forbidden_user_id_filter_patterns" default:""`
 	ForbiddenUserIdFilterEventTypes          *[]string `json:"forbidden_user_id_filter_event_types,omitempty" envconfig:"forbidden_user_id_filter_event_types" default:""`
 	ForbiddenUserIdFilterAllowedUsers        *[]string `json:"forbidden_user_id_filter_allowed_users,omitempty" envconfig:"forbidden_user_id_filter_allowed_users" default:""`
+	MutedRoomsFilterRoomIds                  *[]string `json:"muted_rooms_filter_room_ids,omitempty" envconfig:"muted_rooms_filter_room_ids" default:""`
+	MutedRoomsFilterAllowedUsers             *[]string `json:"muted_rooms_filter_allowed_users,omitempty" envconfig:"muted_rooms_filter_allowed_users" default:""`
+	MutedRoomsFilterDeniedUsers              *[]string `json:"muted_rooms_filter_denied_users,omitempty" envconfig:"muted_rooms_filter_denied_users" default:""`
+	MutedRoomsFilterUsePowerLevels           *bool     `json:"muted_rooms_filter_use_power_levels,omitempty" envconfig:"muted_rooms_filter_use_power_levels" default:"true"`
 	UnsafeSigningKeyFilterEnabled            bool      `json:"unsafe_signing_key_filter_enabled,omitempty" envconfig:"unsafe_signing_key_filter_enabled" default:"true"`
 	FrequencyFilterEventTypes                *[]string `json:"frequency_filter_event_types,omitempty" envconfig:"frequency_filter_event_types" default:"m.room.message,m.sticker,m.reaction"`
 	FrequencyFilterRateLimit                 *float64  `json:"frequency_filter_rate_limit,omitempty" envconfig:"frequency_filter_rate_limit" default:"0"`
