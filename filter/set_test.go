@@ -25,7 +25,11 @@ import (
 )
 
 func AssertCheckEvent(t *testing.T, set *Set, event gomatrixserverlib.PDU, expected *harms.ContentInfo) {
-	info, err := set.CheckEvent(context.Background(), event, nil)
+	AssertCheckEventWithDownloader(t, set, event, expected, nil)
+}
+
+func AssertCheckEventWithDownloader(t *testing.T, set *Set, event gomatrixserverlib.PDU, expected *harms.ContentInfo, downloader media.Downloader) {
+	info, err := set.CheckEvent(context.Background(), event, downloader)
 	assert.NoError(t, err)
 	test.AssertEqualContentInfo(t, expected, info)
 }
