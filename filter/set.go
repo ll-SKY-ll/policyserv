@@ -110,6 +110,7 @@ func (s *Set) CheckEvent(ctx context.Context, event gomatrixserverlib.PDU, media
 				m, err := media.NewItem(url, mediaDownloader)
 				if err != nil {
 					log.Printf("[%s | %s] Non-fatal error creating new media object for '%s': %s", event.EventID(), event.RoomID().String(), url, err)
+					return // don't append nil media objects
 				}
 				log.Printf("[%s | %s] Discovered media on event: %s", event.EventID(), event.RoomID().String(), m)
 				input.Medias = append(input.Medias, m)
