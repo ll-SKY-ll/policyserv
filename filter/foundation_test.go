@@ -12,6 +12,7 @@ import (
 	"github.com/matrix-org/policyserv/config"
 	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
+	"github.com/matrix-org/policyserv/media"
 	"github.com/matrix-org/policyserv/test"
 	"github.com/stretchr/testify/assert"
 )
@@ -43,7 +44,7 @@ func TestMatrixFoundationIntents(t *testing.T) {
 			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything starts as neutral by default in the test
 		}, {
 			// Normal filters
-			EnabledNames:          []string{DensityFilterName, LengthFilterName, ManyAtsFilterName, MediaFilterName, MentionsFilterName, MjolnirFilterName, TrimLengthFilterName},
+			EnabledNames:          []string{DensityFilterName, LengthFilterName, ManyAtsFilterName, MediaFilterName, MentionsFilterName, MjolnirFilterName, TrimLengthFilterName, MediaScanningFilterName},
 			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // only run on still-neutral events
 		}, {
 			// Postfilters
@@ -51,11 +52,13 @@ func TestMatrixFoundationIntents(t *testing.T) {
 			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // only run hellban on spammy events
 		}},
 	}
+	scanner := test.NewMemoryContentScanner(t)
+	scanner.AllowUnexpectedScans = true // we want to ensure we call the content scanner, but we don't actually use its results
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
-	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), scanner)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 	assert.NoError(t, memStorage.SetListBanRules(context.Background(), mjolnirRoomId, map[string]string{
@@ -65,7 +68,11 @@ func TestMatrixFoundationIntents(t *testing.T) {
 
 	for i, run := range foundationEvents {
 		t.Run(fmt.Sprintf("%d (%s)", i, run.Event.EventID()), func(t *testing.T) {
-			AssertCheckEvent(t, set, run.Event, run.Expected)
+			var downloader media.Downloader = nil
+			if run.UseDownloader {
+				downloader = test.MustMakeMediaDownloader(t)
+			}
+			AssertCheckEventWithDownloader(t, set, run.Event, run.Expected, downloader)
 
 			// Give things some time to settle before moving on to the next test case. This is primarily important for the
 			// hellban test cases to ensure the cause event creates a hellban before the effect event.
@@ -79,8 +86,9 @@ func TestMatrixFoundationIntents(t *testing.T) {
 }
 
 type foundationTestCase struct {
-	Event    gomatrixserverlib.PDU
-	Expected *harms.ContentInfo
+	Event         gomatrixserverlib.PDU
+	Expected      *harms.ContentInfo
+	UseDownloader bool
 }
 
 const foundationRoomId = "!foo:example.org"
@@ -122,6 +130,24 @@ func init() {
 				},
 			}),
 			Expected: harms.NeutralContent(),
+		}, {
+			Event: test.MustMakePDU(&test.BaseClientEvent{
+				// This event is also completely neutral, but tries to trip up the media scanning by having a non-media URL in the content.
+				EventId:  "$widget_user1",
+				RoomId:   foundationRoomId,
+				Type:     "im.vector.modular.widgets",
+				StateKey: internal.Pointer("schedule"),
+				Sender:   "@widget_user:example.org",
+				Content: map[string]any{
+					"data": make(map[string]any),
+					"id":   "schedule",
+					"name": "Schedule",
+					"type": "m.custom",
+					"url":  "https://conference.example.org/widget/sofya/",
+				},
+			}),
+			Expected:      harms.NeutralContent(),
+			UseDownloader: true,
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$banned_sender1",

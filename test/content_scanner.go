@@ -17,8 +17,10 @@ type scanExpectation struct {
 }
 
 type MemoryContentScanner struct {
-	T            *testing.T
-	expectations []scanExpectation
+	T *testing.T
+	// When true, scans which aren't populated by Expect are allowed rather than rejected as a failed test
+	AllowUnexpectedScans bool
+	expectations         []scanExpectation
 }
 
 func NewMemoryContentScanner(t *testing.T) *MemoryContentScanner {
@@ -38,6 +40,8 @@ func (m *MemoryContentScanner) Scan(ctx context.Context, contentType content.Typ
 		}
 	}
 
-	assert.Fail(m.T, "unexpected scan")
-	return nil, nil
+	if !m.AllowUnexpectedScans {
+		assert.Fail(m.T, "unexpected scan")
+	}
+	return harms.NeutralContent(), nil
 }
