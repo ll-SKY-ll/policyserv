@@ -280,7 +280,7 @@ func (s *PostgresStorage) GetEventResult(ctx context.Context, eventId string) (*
 		return nil, err
 	}
 
-	if encodedVectors != "" {
+	if encodedVectors != "" && encodedVectors != "{}" {
 		// Legacy code populated vectors as a map[string]float64, so for backwards compatibility we retain that.
 		decodedVectors := make(map[string]float64)
 		if err := json.Unmarshal([]byte(encodedVectors), &decodedVectors); err != nil {
@@ -305,8 +305,9 @@ func (s *PostgresStorage) GetEventResult(ctx context.Context, eventId string) (*
 		if wasAllowed && len(harmIds) == 0 {
 			// an event's content info can only be "allowed" if no other harms were found
 			eventResult.ContentInfo = harms.AllowedContent()
+		} else {
+			eventResult.ContentInfo = harms.ProhibitedContent(harmIds...)
 		}
-		eventResult.ContentInfo = harms.ProhibitedContent(harmIds...)
 	} else {
 		eventResult.ContentInfo = harms.NeutralContent()
 	}
