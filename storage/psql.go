@@ -280,39 +280,48 @@ func (s *PostgresStorage) GetEventResult(ctx context.Context, eventId string) (*
 		return nil, err
 	}
 
-	if encodedVectors != "" && encodedVectors != "{}" {
-		// Legacy code populated vectors as a map[string]float64, so for backwards compatibility we retain that.
-		decodedVectors := make(map[string]float64)
-		if err := json.Unmarshal([]byte(encodedVectors), &decodedVectors); err != nil {
-			return nil, err
-		}
-		wasAllowed := false
-		harmIds := make([]harms.Harm, 0)
-		for k, _ := range decodedVectors {
-			// Per UpsertEventResult, we encode the content class if it's allowed as a "vector". Neutral is never encoded,
-			// and prohibited is implied by the presence of harms (or other legacy vectors).
-			if k == harms.ContentClassAllowed.String() {
-				wasAllowed = true
-				continue
-			}
-			// TODO: We should probably do intelligent mapping of legacy vectors to harms. For now, we just namespace them.
-			if strings.HasPrefix(k, "h:") {
-				harmIds = append(harmIds, harms.Harm(k[2:]))
-			} else {
-				harmIds = append(harmIds, harms.Harm("org.matrix.policyserv.vec."+k))
-			}
-		}
-		if wasAllowed && len(harmIds) == 0 {
-			// an event's content info can only be "allowed" if no other harms were found
-			eventResult.ContentInfo = harms.AllowedContent()
-		} else {
-			eventResult.ContentInfo = harms.ProhibitedContent(harmIds...)
-		}
-	} else {
-		eventResult.ContentInfo = harms.NeutralContent()
+	if err := decodeEventResult(eventResult, encodedVectors); err != nil {
+		return nil, err
 	}
 
 	return eventResult, nil
+}
+
+func decodeEventResult(res *StoredEventResult, encodedVectors string) error {
+	if encodedVectors == "" {
+		encodedVectors = "{}" // simplifies JSON processing
+	}
+	decodedVectors := make(map[string]float64)
+	if err := json.Unmarshal([]byte(encodedVectors), &decodedVectors); err != nil {
+		return fmt.Errorf("failed to decode vectors: %w", err)
+	}
+
+	// Search for an explicit Allow vector
+	harmIds := make([]harms.Harm, 0)
+	for k, _ := range decodedVectors {
+		// Per UpsertEventResult, we encode the content class if it's allowed as a "vector". Neutral is never encoded,
+		// and prohibited is implied by the presence of harms (or other legacy vectors).
+		if k == harms.ContentClassAllowed.String() {
+			res.ContentInfo = harms.AllowedContent()
+			return nil
+		}
+
+		// TODO: We should probably do intelligent mapping of legacy vectors to harms. For now, we just namespace them.
+		if strings.HasPrefix(k, "h:") {
+			harmIds = append(harmIds, harms.Harm(k[2:]))
+		} else {
+			harmIds = append(harmIds, harms.Harm("org.matrix.policyserv.vec."+k))
+		}
+	}
+
+	// If the event was spammy, retain that status. Otherwise, the vectors are probably just debugging information
+	// left behind (like "spam: 0.5" on a Neutral event)
+	if res.IsProbablySpam {
+		res.ContentInfo = harms.ProhibitedContent(harmIds...)
+	} else {
+		res.ContentInfo = harms.NeutralContent()
+	}
+	return nil
 }
 
 func (s *PostgresStorage) UpsertEventResult(ctx context.Context, event *StoredEventResult) error {
