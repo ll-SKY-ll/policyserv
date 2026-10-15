@@ -97,7 +97,7 @@ func (p *Pool) Submit(ctx context.Context, event gomatrixserverlib.PDU, mediaDow
 			}
 
 			// Consider the context in our delivery of the result
-			log.Printf("[%s | %s] Sending result: %+v", event.EventID(), event.RoomID().String(), res)
+			log.Printf("[%s | %s] Sending result: %+v (%s)", event.EventID(), event.RoomID().String(), res, res.ContentInfo.Class())
 			select {
 			case waitCh <- res:
 			case <-ctx.Done():
@@ -137,7 +137,7 @@ func (p *Pool) Submit(ctx context.Context, event gomatrixserverlib.PDU, mediaDow
 			}
 			return res, err
 		})
-		log.Printf("[%s | %s] Result from singleflight: %v, %v", event.EventID(), event.RoomID().String(), res, err)
+		log.Printf("[%s | %s] Result from singleflight: %v (%s), %v", event.EventID(), event.RoomID().String(), res, res.contentInfo.Class(), err)
 		if res == nil {
 			if err == nil {
 				// "should never happen"
