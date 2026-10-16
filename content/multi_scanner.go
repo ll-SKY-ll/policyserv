@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/matrix-org/policyserv/filter/classification"
+	"github.com/matrix-org/policyserv/harms"
 )
 
 type MultiScanner struct {
@@ -17,7 +17,7 @@ func NewMultiScanner(scanners ...Scanner) *MultiScanner {
 	return &MultiScanner{scanners: scanners}
 }
 
-func (m *MultiScanner) Scan(ctx context.Context, contentType Type, content []byte) ([]classification.Classification, error) {
+func (m *MultiScanner) Scan(ctx context.Context, contentType Type, content []byte) (*harms.ContentInfo, error) {
 	var allErrors []error
 
 	for i, scanner := range m.scanners {
@@ -27,8 +27,8 @@ func (m *MultiScanner) Scan(ctx context.Context, contentType Type, content []byt
 			allErrors = append(allErrors, fmt.Errorf("scanner %d: %w", i, err))
 			continue
 		}
-		if len(results) > 0 {
-			log.Printf("[MultiScanner] Scanner %d flagged content: %v", i, results)
+		if results != nil && results.Class() == harms.ContentClassProhibited {
+			log.Printf("[MultiScanner] Scanner %d flagged content: %v", i, results.Harms())
 			return results, nil
 		}
 	}
@@ -37,5 +37,5 @@ func (m *MultiScanner) Scan(ctx context.Context, contentType Type, content []byt
 		return nil, errors.Join(allErrors...)
 	}
 
-	return nil, nil
+	return harms.NeutralContent(), nil
 }

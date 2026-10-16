@@ -7,24 +7,25 @@ import (
 	"strings"
 
 	"github.com/matrix-org/gomatrixserverlib/spec"
-	"github.com/matrix-org/policyserv/filter/classification"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
 	"github.com/matrix-org/policyserv/metrics"
 	"github.com/matrix-org/policyserv/trust"
 )
 
-// Developer note: this filter is intended to run as a *postfilter*, not a prefilter.
+// Developer note: this filter is intended to run in its own set group *after* the hellban postfilter group, checking
+// neutral and allowed content.
 //
-// HellbanPostfilter decides whether to hellban a sender by reading input.IncrementalConfidenceVectors, which is the
-// vector snapshot taken *before* its own set group runs. Filters in the same group as it are therefore invisible to
-// it. Running the mute as a prefilter instead would mean that any user who innocently sends a message to a muted
-// room (mutes are not visible to clients) gets hellbanned across the entire community, and would get re-hellbanned
-// on every retry after the previous one expired. Keeping the mute in the postfilter group makes that structurally
-// impossible rather than conditionally avoided.
+// HellbanPostfilter runs on any event which an earlier group marked as prohibited, and assumes that event is spam. If
+// the mute ran in any group before it, a user who innocently sends a message to a muted room (mutes are not visible to
+// clients) would get hellbanned across the entire community, and re-hellbanned on every retry after the previous one
+// expired. Running after the hellban group makes that structurally impossible rather than conditionally avoided.
+//
+// Allowed content is checked too, so the sender and event type allowlists can't bypass a mute.
 //
 // The cost of this placement is that muted rooms still run the full middle filter group (media downloads, HMA, local
-// AI scanners, OpenAI). That's deliberate: it keeps real classifications (csam, etc.) flowing into the audit trail
-// for muted rooms instead of collapsing everything to "spam, because muted".
+// AI scanners, OpenAI). That's deliberate: it keeps real harms (csam, etc.) flowing into the audit trail for muted
+// rooms instead of collapsing everything to "spam, because muted".
 
 const MutedRoomsFilterName = "MutedRoomsFilter"
 
@@ -105,10 +106,10 @@ func (f *InstancedMutedRoomsFilter) Name() string {
 	return MutedRoomsFilterName
 }
 
-func (f *InstancedMutedRoomsFilter) CheckEvent(ctx context.Context, input *EventInput) ([]classification.Classification, error) {
+func (f *InstancedMutedRoomsFilter) CheckEvent(ctx context.Context, input *EventInput) (*harms.ContentInfo, error) {
 	roomId := input.Event.RoomID().String()
 	if !f.mutedRooms[roomId] {
-		return nil, nil // the room isn't muted, so we have no opinion on the event
+		return harms.NeutralContent(), nil // the room isn't muted, so we have no opinion on the event
 	}
 
 	// Membership events always pass. Muting a leave traps the user in the room and diverges room state, and muting
@@ -116,19 +117,19 @@ func (f *InstancedMutedRoomsFilter) CheckEvent(ctx context.Context, input *Event
 	// way of knowing the mute exists.
 	if input.Event.Type() == spec.MRoomMember {
 		metrics.RecordMutedRoomEvent(roomId, metrics.MutedRoomOutcomeMembership)
-		return nil, nil
+		return harms.NeutralContent(), nil
 	}
 
 	uid := input.Event.SenderID().ToUserID()
 	if uid == nil {
-		return nil, nil // Set.CheckEvent already flags these events, so there's nothing useful to add
+		return harms.NeutralContent(), nil // Set.CheckEvent already flags these events, so there's nothing useful to add
 	}
 	userId := uid.String()
 
 	if f.alwaysAllowed[userId] {
 		log.Printf("[%s | %s] MutedRoomsFilter: %s is exempt from the mute", input.Event.EventID(), roomId, userId)
 		metrics.RecordMutedRoomEvent(roomId, metrics.MutedRoomOutcomeConfigured)
-		return nil, nil
+		return harms.NeutralContent(), nil
 	}
 
 	// Power levels and room creators beat the deny list.
@@ -140,7 +141,7 @@ func (f *InstancedMutedRoomsFilter) CheckEvent(ctx context.Context, input *Event
 		if has == trust.TristateTrue {
 			log.Printf("[%s | %s] MutedRoomsFilter: %T exempts %s from the mute", input.Event.EventID(), roomId, source, userId)
 			metrics.RecordMutedRoomEvent(roomId, metrics.MutedRoomOutcomePowerLevels)
-			return nil, nil
+			return harms.NeutralContent(), nil
 		}
 	}
 
@@ -152,12 +153,10 @@ func (f *InstancedMutedRoomsFilter) CheckEvent(ctx context.Context, input *Event
 	}
 	if has == trust.TristateTrue {
 		metrics.RecordMutedRoomEvent(roomId, metrics.MutedRoomOutcomeAllowGlob)
-		return nil, nil
+		return harms.NeutralContent(), nil
 	}
 
 	log.Printf("[%s | %s] MutedRoomsFilter: muted %s from %s", input.Event.EventID(), roomId, input.Event.Type(), userId)
 	metrics.RecordMutedRoomEvent(roomId, metrics.MutedRoomOutcomeMuted)
-	return []classification.Classification{
-		classification.Spam,
-	}, nil
+	return harms.ProhibitedContent(harms.SpamGeneral), nil
 }

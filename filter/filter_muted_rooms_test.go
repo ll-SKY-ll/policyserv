@@ -6,7 +6,7 @@ import (
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/policyserv/config"
-	"github.com/matrix-org/policyserv/filter/classification"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
 	"github.com/matrix-org/policyserv/test"
 	"github.com/matrix-org/policyserv/trust"
@@ -26,9 +26,8 @@ func makeMutedRoomsSet(t *testing.T, communityConfig *config.CommunityConfig) *S
 			HomeserverName: "policyserv.example.org",
 		},
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{MutedRoomsFilterName},
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{MutedRoomsFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral, harms.ContentClassAllowed},
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
@@ -36,7 +35,7 @@ func makeMutedRoomsSet(t *testing.T, communityConfig *config.CommunityConfig) *S
 	ps := test.NewMemoryPubsub(t)
 	t.Cleanup(func() { ps.Close() })
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 
@@ -89,14 +88,12 @@ func makeMutedRoomsMessage(eventId string, roomId string, sender string) gomatri
 	})
 }
 
-// assertMuted - the filter never returns "not spam", so an unmuted event leaves the 0.5 seed value in place.
+// assertMuted - the filter never returns allowed content, so an unmuted event stays neutral.
 func assertMuted(t *testing.T, set *Set, event gomatrixserverlib.PDU, isMuted bool) {
-	vecs, err := set.CheckEvent(context.Background(), event, nil)
-	assert.NoError(t, err)
 	if isMuted {
-		assert.Equalf(t, 1.0, vecs.GetVector(classification.Spam), "%s should have been muted", event.EventID())
+		AssertCheckEvent(t, set, event, harms.ProhibitedContent(harms.SpamGeneral))
 	} else {
-		assert.Equalf(t, 0.5, vecs.GetVector(classification.Spam), "%s should not have been muted", event.EventID())
+		AssertCheckEvent(t, set, event, harms.NeutralContent())
 	}
 }
 

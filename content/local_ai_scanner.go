@@ -10,15 +10,17 @@ import (
 	"mime/multipart"
 	"net/http"
 
-	"github.com/matrix-org/policyserv/filter/classification"
+	"github.com/matrix-org/policyserv/harms"
 )
 
 // LocalAIScannerDef defines an available scanner at the instance level.
-// The type is a unique identifier (e.g. "nsfw", "violence") and the URL
-// is the base URL of the scanner service.
+// The type is a unique identifier (e.g. "nsfw", "violence"), the URL
+// is the base URL of the scanner service, and Harms are the harm IDs
+// reported when the scanner flags content.
 type LocalAIScannerDef struct {
-	Type string
-	Url  string
+	Type  string
+	Url   string
+	Harms []harms.Harm
 }
 
 // LocalAIScannerCommunityConfig defines a community's opt-in to a specific
@@ -35,6 +37,7 @@ type LocalAIScanner struct {
 	scannerType string
 	apiBaseUrl  string
 	threshold   float64
+	harms       []harms.Harm
 }
 
 type localAIScanResponse struct {
@@ -46,7 +49,7 @@ type localAIScanResponse struct {
 
 // NewLocalAIScanner creates a scanner targeting a specific scanner service.
 // The threshold is the minimum score to trigger a positive classification.
-func NewLocalAIScanner(scannerType string, apiBaseUrl string, threshold float64) (*LocalAIScanner, error) {
+func NewLocalAIScanner(scannerType string, apiBaseUrl string, threshold float64, harmIds []harms.Harm) (*LocalAIScanner, error) {
 	if apiBaseUrl == "" {
 		return nil, fmt.Errorf("local AI scanner URL is required for type %q", scannerType)
 	}
@@ -57,13 +60,14 @@ func NewLocalAIScanner(scannerType string, apiBaseUrl string, threshold float64)
 		scannerType: scannerType,
 		apiBaseUrl:  apiBaseUrl,
 		threshold:   threshold,
+		harms:       harmIds,
 	}, nil
 }
 
-func (s *LocalAIScanner) Scan(ctx context.Context, contentType Type, content []byte) ([]classification.Classification, error) {
+func (s *LocalAIScanner) Scan(ctx context.Context, contentType Type, content []byte) (*harms.ContentInfo, error) {
 	if contentType != TypePhoto {
 		log.Printf("[LocalAIScanner:%s] Skipping non-photo content type: %s", s.scannerType, contentType)
-		return nil, nil
+		return harms.NeutralContent(), nil
 	}
 
 	resp, err := s.classify(ctx, content)
@@ -73,11 +77,11 @@ func (s *LocalAIScanner) Scan(ctx context.Context, contentType Type, content []b
 
 	if resp.Score >= s.threshold {
 		log.Printf("[LocalAIScanner:%s] Flagged (score=%.4f, threshold=%.4f, model=%s)", s.scannerType, resp.Score, s.threshold, resp.Model)
-		return []classification.Classification{classification.Spam}, nil
+		return harms.ProhibitedContent(append([]harms.Harm{harms.PolicyservMedia}, s.harms...)...), nil
 	}
 
 	log.Printf("[LocalAIScanner:%s] Clean (score=%.4f, threshold=%.4f)", s.scannerType, resp.Score, s.threshold)
-	return nil, nil
+	return harms.NeutralContent(), nil
 }
 
 func (s *LocalAIScanner) classify(ctx context.Context, imageBytes []byte) (*localAIScanResponse, error) {
@@ -123,8 +127,9 @@ func (s *LocalAIScanner) classify(ctx context.Context, imageBytes []byte) (*loca
 }
 
 // ParseLocalAIScannerDefs parses the instance-level scanner definitions from
-// the env var format: "type1|url1,type2|url2"
-// e.g. "nsfw|http://127.0.0.1:5000,violence|http://127.0.0.1:5001"
+// the env var format: "type|url|harm;harm,type|url|harm"
+// e.g. "nsfw|http://127.0.0.1:5000|org.matrix.msc4456.adult,violence|http://127.0.0.1:5001|org.matrix.msc4456.violence.graphic"
+// The harm list is optional; without it, flagged content is reported as org.matrix.msc4456.other.
 func ParseLocalAIScannerDefs(raw string) ([]LocalAIScannerDef, error) {
 	if raw == "" {
 		return nil, nil
@@ -133,12 +138,19 @@ func ParseLocalAIScannerDefs(raw string) ([]LocalAIScannerDef, error) {
 	var defs []LocalAIScannerDef
 	for _, entry := range splitAndTrim(raw, ",") {
 		parts := splitAndTrim(entry, "|")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid scanner definition %q: expected type|url", entry)
+		if len(parts) != 2 && len(parts) != 3 {
+			return nil, fmt.Errorf("invalid scanner definition %q: expected type|url or type|url|harms", entry)
+		}
+		harmIds := make([]harms.Harm, 0)
+		if len(parts) == 3 {
+			for _, h := range splitAndTrim(parts[2], ";") {
+				harmIds = append(harmIds, harms.Harm(h))
+			}
 		}
 		defs = append(defs, LocalAIScannerDef{
-			Type: parts[0],
-			Url:  parts[1],
+			Type:  parts[0],
+			Url:   parts[1],
+			Harms: harmIds,
 		})
 	}
 	return defs, nil

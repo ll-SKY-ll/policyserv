@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/matrix-org/gomatrixserverlib/spec"
-	"github.com/matrix-org/policyserv/filter/classification"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
 	"github.com/ryanuber/go-glob"
 )
@@ -86,12 +86,12 @@ func (f *InstancedForbiddenUserIdFilter) Name() string {
 	return ForbiddenUserIdFilterName
 }
 
-func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *EventInput) ([]classification.Classification, error) {
+func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *EventInput) (*harms.ContentInfo, error) {
 	eventType := input.Event.Type()
 
 	// Check if this event type is one we should inspect.
 	if !f.matchAllEventTypes && !f.eventTypeSet[eventType] {
-		return nil, nil
+		return harms.NeutralContent(), nil
 	}
 
 	// Determine the user ID to check.
@@ -102,14 +102,14 @@ func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *
 		membership, err := input.Event.Membership()
 		if err != nil {
 			log.Printf("[%s | %s] ForbiddenUserIdFilter: error reading membership: %s", input.Event.EventID(), input.Event.RoomID().String(), err)
-			return nil, nil
+			return harms.NeutralContent(), nil
 		}
 
 		// Never block leave events. If the join soft-failed, the leave will too.
 		// If the join didn't soft-fail, the leave needs to go through to avoid
 		// a diverging room state.
 		if membership == spec.Leave {
-			return nil, nil
+			return harms.NeutralContent(), nil
 		}
 
 		// For non-leave membership events, check the state_key (target user).
@@ -118,7 +118,7 @@ func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *
 		// spammy user ID are never blocked.
 		stateKey := input.Event.StateKey()
 		if stateKey == nil || len(*stateKey) == 0 {
-			return nil, nil
+			return harms.NeutralContent(), nil
 		}
 
 		senderUserId := ""
@@ -130,7 +130,7 @@ func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *
 		if senderUserId != *stateKey {
 			// Sender != target: this is an admin/moderator action (kick, ban, etc.)
 			// Always allow these through.
-			return nil, nil
+			return harms.NeutralContent(), nil
 		}
 
 		userId = *stateKey
@@ -138,23 +138,21 @@ func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *
 		// For all other event types, check the sender.
 		uid := input.Event.SenderID().ToUserID()
 		if uid == nil {
-			return nil, nil
+			return harms.NeutralContent(), nil
 		}
 		userId = uid.String()
 	}
 
 	// Check whitelist first — allowed users bypass all pattern checks.
 	if f.allowedUserSet[userId] {
-		return nil, nil
+		return harms.NeutralContent(), nil
 	}
 
 	// Check against glob patterns.
 	for _, pattern := range f.globPatterns {
 		if glob.Glob(pattern, userId) {
 			log.Printf("[%s | %s] ForbiddenUserIdFilter: denied %s from %s (matched glob: %s)", input.Event.EventID(), input.Event.RoomID().String(), eventType, userId, pattern)
-			return []classification.Classification{
-				classification.Spam,
-			}, nil
+			return harms.ProhibitedContent(harms.SpamGeneral), nil
 		}
 	}
 
@@ -162,11 +160,9 @@ func (f *InstancedForbiddenUserIdFilter) CheckEvent(ctx context.Context, input *
 	for _, re := range f.compiledRegexes {
 		if re.MatchString(userId) {
 			log.Printf("[%s | %s] ForbiddenUserIdFilter: denied %s from %s (matched regex: %s)", input.Event.EventID(), input.Event.RoomID().String(), eventType, userId, re.String())
-			return []classification.Classification{
-				classification.Spam,
-			}, nil
+			return harms.ProhibitedContent(harms.SpamGeneral), nil
 		}
 	}
 
-	return nil, nil
+	return harms.NeutralContent(), nil
 }

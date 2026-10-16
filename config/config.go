@@ -61,8 +61,8 @@ type InstanceConfig struct {
 	HMAApiUrl string `envconfig:"hma_api_url" default:""`
 	HMAApiKey string `envconfig:"hma_api_key" default:""`
 
-	// Local AI image scanners. Format: "type|url,type|url"
-	// e.g. "nsfw|http://127.0.0.1:5000,violence|http://127.0.0.1:5001"
+	// Local AI image scanners. Format: "type|url|harm;harm,type|url|harm" (harm list optional)
+	// e.g. "nsfw|http://127.0.0.1:5000|org.matrix.msc4456.adult,violence|http://127.0.0.1:5001|org.matrix.msc4456.violence.graphic"
 	// Communities opt in to specific scanner types via their config.
 	LocalAIScanners string `envconfig:"local_ai_scanners" default:""`
 
