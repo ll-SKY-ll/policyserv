@@ -2,7 +2,7 @@ package filter
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,8 +10,9 @@ import (
 
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/policyserv/config"
-	"github.com/matrix-org/policyserv/filter/classification"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
+	"github.com/matrix-org/policyserv/media"
 	"github.com/matrix-org/policyserv/test"
 	"github.com/stretchr/testify/assert"
 )
@@ -22,12 +23,10 @@ func TestMatrixFoundationIntents(t *testing.T) {
 	// Note: this test doesn't need to use real config values or events from production. Its purpose is to
 	// ensure that it's *possible* to separate spam from neutral events when layering multiple filters.
 
-	spamThreshold := 0.8
 	mjolnirRoomId := "!mjolnir:example.org"
 
 	communityConfig, err := config.NewDefaultCommunityConfig()
 	assert.NoError(t, err)
-	communityConfig.SpamThreshold = &spamThreshold
 	communityConfig.SenderPrefilterAllowedSenders = &[]string{foundationAdmin}
 	communityConfig.MjolnirFilterEnabled = internal.Pointer(true)
 	communityConfig.DensityFilterMaxDensity = internal.Pointer(0.95)
@@ -41,26 +40,25 @@ func TestMatrixFoundationIntents(t *testing.T) {
 		CommunityConfig: communityConfig,
 		Groups: []*SetGroupConfig{{
 			// Prefilters
-			EnabledNames:           []string{HellbanPrefilterName, SenderFilterName, EventTypeFilterName},
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{HellbanPrefilterName, SenderFilterName, EventTypeFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything starts as neutral by default in the test
 		}, {
 			// Normal filters
-			EnabledNames:           []string{DensityFilterName, LengthFilterName, ManyAtsFilterName, MediaFilterName, MentionsFilterName, MjolnirFilterName, TrimLengthFilterName},
-			MinimumSpamVectorValue: 0.2,
-			MaximumSpamVectorValue: 0.7,
+			EnabledNames:          []string{DensityFilterName, LengthFilterName, ManyAtsFilterName, MediaFilterName, MentionsFilterName, MjolnirFilterName, TrimLengthFilterName, MediaScanningFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // only run on still-neutral events
 		}, {
 			// Postfilters
-			EnabledNames:           []string{HellbanPostfilterName},
-			MinimumSpamVectorValue: spamThreshold,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{HellbanPostfilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // only run hellban on spammy events
 		}},
 	}
+	scanner := test.NewMemoryContentScanner(t)
+	scanner.AllowUnexpectedScans = true // we want to ensure we call the content scanner, but we don't actually use its results
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), scanner)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 	assert.NoError(t, memStorage.SetListBanRules(context.Background(), mjolnirRoomId, map[string]string{
@@ -69,19 +67,17 @@ func TestMatrixFoundationIntents(t *testing.T) {
 	assert.NoError(t, memStorage.SetUserIdsAndDisplayNamesByRoomId(context.Background(), foundationRoomId, foundationMentionIds, foundationMentionNames))
 
 	for i, run := range foundationEvents {
-		log.Printf("Running test case %d - %s", i, run.Event.EventID())
-		vecs, err := set.CheckEvent(context.Background(), run.Event, nil)
-		assert.NoError(t, err)
-		assert.NotNil(t, vecs)
-		if run.IsSpam {
-			assert.LessOrEqualf(t, spamThreshold, vecs.GetVector(classification.Spam), "%d (%s) should be spam, but was %f", i, run.Event.EventID(), vecs.GetVector(classification.Spam))
-		} else {
-			assert.Greaterf(t, spamThreshold, vecs.GetVector(classification.Spam), "%d (%s) should NOT be spam, but was %f", i, run.Event.EventID(), vecs.GetVector(classification.Spam))
-		}
+		t.Run(fmt.Sprintf("%d (%s)", i, run.Event.EventID()), func(t *testing.T) {
+			var downloader media.Downloader = nil
+			if run.UseDownloader {
+				downloader = test.MustMakeMediaDownloader(t)
+			}
+			AssertCheckEventWithDownloader(t, set, run.Event, run.Expected, downloader)
 
-		// Give things some time to settle before moving on to the next test case. This is primarily important for the
-		// hellban test cases to ensure the cause event creates a hellban before the effect event.
-		time.Sleep(100 * time.Millisecond)
+			// Give things some time to settle before moving on to the next test case. This is primarily important for the
+			// hellban test cases to ensure the cause event creates a hellban before the effect event.
+			time.Sleep(100 * time.Millisecond)
+		})
 	}
 
 	// We deferred a bunch of close operations, but sometimes these operations can race with the test cases above causing
@@ -90,8 +86,9 @@ func TestMatrixFoundationIntents(t *testing.T) {
 }
 
 type foundationTestCase struct {
-	Event  gomatrixserverlib.PDU
-	IsSpam bool
+	Event         gomatrixserverlib.PDU
+	Expected      *harms.ContentInfo
+	UseDownloader bool
 }
 
 const foundationRoomId = "!foo:example.org"
@@ -119,7 +116,7 @@ func init() {
 					"msgtype": "m.image", // try to activate the filter rules
 				},
 			}),
-			IsSpam: false,
+			Expected: harms.AllowedContent(),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				// This event is completely neutral: sender isn't special, event type is a message, and the body is fine (but long, to try triggering a few filters)
@@ -132,7 +129,25 @@ func init() {
 					"body":    "hello world! I'm trying to get help with running policyserv. Can someone help me understand what these logs mean?\n```text\n2025/09/09 15:42:05 Registered DensityFilter as &filter.DensityFilter{}\n2025/09/09 15:42:05 Registered EventTypeFilter as &filter.EventTypeFilter{}\n2025/09/09 15:42:05 Registered HellbanPrefilter as &filter.HellbanPrefilter{}\n2025/09/09 15:42:05 Registered HellbanPostfilter as &filter.HellbanPostfilter{}\n2025/09/09 15:42:05 Registered KeywordFilter as &filter.KeywordFilter{}\n2025/09/09 15:42:05 Registered LengthFilter as &filter.LengthFilter{}\n2025/09/09 15:42:05 Registered ManyAtsFilter as &filter.ManyAtsFilter{}\n2025/09/09 15:42:05 Registered MediaFilter as &filter.MediaFilter{}\n2025/09/09 15:42:05 Registered MentionsFilter as &filter.MentionsFilter{}\n2025/09/09 15:42:05 Registered MjolnirFilter as &filter.MjolnirFilter{}\n2025/09/09 15:42:05 Registered SenderFilter as &filter.SenderFilter{}\n2025/09/09 15:42:05 Registered TrimLengthFilter as &filter.TrimLengthFilter{}\n2025/09/09 15:42:05 Registered FixedFilter as &filter.FixedCanBeInstancedFilter{}\n2025/09/09 15:42:05 Registered ErrorFilter as &filter.ErrorFilter{}```\nThanks!",
 				},
 			}),
-			IsSpam: false,
+			Expected: harms.NeutralContent(),
+		}, {
+			Event: test.MustMakePDU(&test.BaseClientEvent{
+				// This event is also completely neutral, but tries to trip up the media scanning by having a non-media URL in the content.
+				EventId:  "$widget_user1",
+				RoomId:   foundationRoomId,
+				Type:     "im.vector.modular.widgets",
+				StateKey: internal.Pointer("schedule"),
+				Sender:   "@widget_user:example.org",
+				Content: map[string]any{
+					"data": make(map[string]any),
+					"id":   "schedule",
+					"name": "Schedule",
+					"type": "m.custom",
+					"url":  "https://conference.example.org/widget/sofya/",
+				},
+			}),
+			Expected:      harms.NeutralContent(),
+			UseDownloader: true,
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$banned_sender1",
@@ -143,7 +158,7 @@ func init() {
 					"body": "doesn't matter",
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.OtherGeneral, harms.SpamFlooding),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$media1",
@@ -155,7 +170,7 @@ func init() {
 					"body":    "hello world",
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.SpamGeneral, harms.SpamFlooding, harms.PolicyservMedia),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$mentions_neutral1",
@@ -167,7 +182,7 @@ func init() {
 					"body":    strings.Join(foundationMentionNames[0:5], " "), // not enough to trigger filter
 				},
 			}),
-			IsSpam: false,
+			Expected: harms.NeutralContent(),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$mentions_spam1",
@@ -179,7 +194,7 @@ func init() {
 					"body":    strings.Join(foundationMentionNames, " "), // should be enough to trigger filter
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.SpamFlooding),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$length_spam1",
@@ -191,7 +206,7 @@ func init() {
 					"body":    strings.Repeat("spammy spam", 10000),
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.SpamFlooding),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$density_spam1",
@@ -203,7 +218,7 @@ func init() {
 					"body":    strings.Repeat("spammy-spam", 100),
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.SpamFlooding),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$hellban_cause",
@@ -215,7 +230,7 @@ func init() {
 					"body":    strings.Repeat("spammy-spam", 100), // anything to cause a ban
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.SpamFlooding),
 		}, {
 			Event: test.MustMakePDU(&test.BaseClientEvent{
 				EventId: "$hellban_effect",
@@ -227,7 +242,7 @@ func init() {
 					"body":    "fine, but hellbanned", // a normal message, but the user should be picked up by hellban
 				},
 			}),
-			IsSpam: true,
+			Expected: harms.ProhibitedContent(harms.SpamFlooding),
 		},
 	}
 }

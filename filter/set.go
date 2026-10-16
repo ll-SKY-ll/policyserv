@@ -11,11 +11,9 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/policyserv/config"
 	"github.com/matrix-org/policyserv/content"
-	"github.com/matrix-org/policyserv/filter/audit"
-	"github.com/matrix-org/policyserv/filter/classification"
-	"github.com/matrix-org/policyserv/filter/confidence"
-	"github.com/matrix-org/policyserv/internal"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/media"
+	"github.com/matrix-org/policyserv/notifiers"
 	"github.com/matrix-org/policyserv/pubsub"
 	"github.com/matrix-org/policyserv/storage"
 )
@@ -31,7 +29,7 @@ type SetConfig struct {
 type Set struct {
 	storage         storage.PersistentStorage
 	pubsub          pubsub.Client
-	queue           *audit.Queue
+	notifier        notifiers.MatrixNotifier
 	contentScanner  content.Scanner // may be nil if scanning not possible
 	groups          []*setGroup
 	communityConfig *config.CommunityConfig
@@ -39,11 +37,14 @@ type Set struct {
 	communityId     string
 }
 
-func NewSet(config *SetConfig, storage storage.PersistentStorage, pubsub pubsub.Client, queue *audit.Queue, contentScanner content.Scanner) (*Set, error) {
+func NewSet(config *SetConfig, storage storage.PersistentStorage, pubsub pubsub.Client, notifier notifiers.MatrixNotifier, contentScanner content.Scanner) (*Set, error) {
+	if config.CommunityId == "" {
+		config.CommunityId = "default"
+	}
 	set := &Set{
 		storage:         storage,
 		pubsub:          pubsub,
-		queue:           queue,
+		notifier:        notifier,
 		contentScanner:  contentScanner,
 		groups:          make([]*setGroup, len(config.Groups)),
 		communityConfig: config.CommunityConfig,
@@ -52,9 +53,8 @@ func NewSet(config *SetConfig, storage storage.PersistentStorage, pubsub pubsub.
 	}
 	for i, groupCnf := range config.Groups {
 		set.groups[i] = &setGroup{
-			filters:            make([]Instanced, 0),
-			minSpamVectorValue: groupCnf.MinimumSpamVectorValue,
-			maxSpamVectorValue: groupCnf.MaximumSpamVectorValue,
+			filters:               make([]Instanced, 0),
+			checkedContentClasses: groupCnf.CheckedContentClasses,
 		}
 		for _, name := range groupCnf.EnabledNames {
 			f, err := findByName(name)
@@ -71,36 +71,27 @@ func NewSet(config *SetConfig, storage storage.PersistentStorage, pubsub pubsub.
 	return set, nil
 }
 
-// GetStorage - Accessor to the underlying PersistentStorage
-func (s *Set) GetStorage() storage.PersistentStorage {
-	return s.storage
-}
-
 // CheckEvent - Checks an event over all of the set groups in order. If a set group errors, execution stops there.
 // Note: the mediaDownloader may be nil to prevent parsing and downloading of media. This should only be done in test environments.
-func (s *Set) CheckEvent(ctx context.Context, event gomatrixserverlib.PDU, mediaDownloader media.Downloader) (confidence.Vectors, error) {
+func (s *Set) CheckEvent(ctx context.Context, event gomatrixserverlib.PDU, mediaDownloader media.Downloader) (*harms.ContentInfo, error) {
 	log.Printf("[%s | %s | %s] Checking event", event.EventID(), event.RoomID().String(), s.communityId)
 
 	if !event.SenderID().IsUserID() || event.SenderID().ToUserID() == nil {
 		log.Printf("[%s | %s] Skipping event and flagging as spam because sender is not a user", event.EventID(), event.RoomID().String())
-		return confidence.Vectors{
-			classification.Spam:          1,
-			classification.NonCompliance: 1,
-		}, nil
+		return harms.ProhibitedContent(harms.SpamGeneral, harms.PolicyservSpecNonCompliance), nil
 	}
 
-	vecs := confidence.NewConfidenceVectors()
-	vecs.SetVector(classification.Spam, 0.5) // per docs elsewhere, start by assuming 50% likelihood of spam
-	auditCtx, err := newAuditContext(s.instanceConfig, event, internal.Dereference(s.communityConfig.WebhookUrl))
+	contentClass := harms.ContentClassNeutral
+	harmIds := make([]harms.Harm, 0)
+	auditCtx, err := newAuditContext(s.notifier, s.communityId, event)
 	if err != nil {
 		return nil, err
 	}
 	for i, group := range s.groups {
 		input := &EventInput{
-			Event:                        event,
-			IncrementalConfidenceVectors: vecs,
-			auditContext:                 auditCtx,
-			Medias:                       make([]*media.Item, 0),
+			Event:        event,
+			auditContext: auditCtx,
+			Medias:       make([]*media.Item, 0),
 		}
 
 		if mediaDownloader != nil {
@@ -119,6 +110,7 @@ func (s *Set) CheckEvent(ctx context.Context, event gomatrixserverlib.PDU, media
 				m, err := media.NewItem(url, mediaDownloader)
 				if err != nil {
 					log.Printf("[%s | %s] Non-fatal error creating new media object for '%s': %s", event.EventID(), event.RoomID().String(), url, err)
+					return // don't append nil media objects
 				}
 				log.Printf("[%s | %s] Discovered media on event: %s", event.EventID(), event.RoomID().String(), m)
 				input.Medias = append(input.Medias, m)
@@ -129,55 +121,43 @@ func (s *Set) CheckEvent(ctx context.Context, event gomatrixserverlib.PDU, media
 			log.Printf("[%s | %s] Skipping media extraction as mediaDownloader is nil", event.EventID(), event.RoomID().String())
 		}
 
-		v, err := group.checkEvent(ctx, input)
+		info, err := group.checkEvent(ctx, harms.NewContentInfo(contentClass, harmIds...), input)
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("error at group %d", i), err)
 		}
-		vecs = s.combineVectors(vecs, v)
-
-		auditCtx.AppendSetGroupVectors(v)
+		if info.Class() > contentClass {
+			contentClass = info.Class()
+		}
+		harmIds = append(harmIds, info.Harms()...)
 	}
-	auditCtx.FinalVectors = vecs
-	auditCtx.IsSpam = s.IsSpamResponse(ctx, vecs)
+
+	info := harms.NewContentInfo(contentClass, harmIds...)
+	auditCtx.IsSpam = info.Class() == harms.ContentClassProhibited
 	go func(auditCtx *auditContext, s *Set) { // run the audit publishing async to avoid blocking the hot path any more than required
-		err := auditCtx.Publish(s.queue)
+		err := auditCtx.Publish()
 		if err != nil {
 			log.Printf("[%s | %s] Non-fatal error publishing audit: %s", auditCtx.Event.EventID(), auditCtx.Event.RoomID().String(), err)
 		}
 	}(auditCtx, s)
-	return vecs, nil
+	return info, nil
 }
 
-func (s *Set) CheckText(ctx context.Context, text string) (confidence.Vectors, error) {
+func (s *Set) CheckText(ctx context.Context, text string) (*harms.ContentInfo, error) {
 	log.Printf("[CheckText | %s] Checking text", s.communityId)
-	vecs := confidence.NewConfidenceVectors()
-	vecs.SetVector(classification.Spam, 0.5) // per docs elsewhere, start by assuming 50% likelihood of spam
+	contentClass := harms.ContentClassNeutral
+	harmIds := make([]harms.Harm, 0)
 	// TODO: Audit context/webhooks
 	for i, group := range s.groups {
-		v, err := group.checkText(ctx, vecs, text)
+		info, err := group.checkText(ctx, harms.NewContentInfo(contentClass, harmIds...), text)
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("error at group %d", i), err)
 		}
-		vecs = s.combineVectors(vecs, v)
-	}
-	return vecs, nil
-}
-
-func (s *Set) combineVectors(incremental confidence.Vectors, group confidence.Vectors) confidence.Vectors {
-	for cls, val := range group {
-		// If we've already flagged some content as spam, don't allow that to be un-flagged.
-		// Note: we compare using .String() because it returns the uninverted value, if inverted.
-		if cls.String() == classification.Spam.String() && incremental.GetVector(classification.Spam) > 0.5 { // 0.5 to escape the seed value
-			continue
+		if info.Class() > contentClass {
+			contentClass = info.Class()
 		}
-		incremental.SetVector(cls, val) // overwrite rather than average
+		harmIds = append(harmIds, info.Harms()...)
 	}
-	return incremental
-}
-
-func (s *Set) IsSpamResponse(ctx context.Context, vecs confidence.Vectors) bool {
-	val := vecs.GetVector(classification.Spam)
-	return val >= internal.Dereference(s.communityConfig.SpamThreshold)
+	return harms.NewContentInfo(contentClass, harmIds...), nil
 }
 
 func (s *Set) Close() error {

@@ -6,61 +6,50 @@ import (
 	"fmt"
 	"html"
 	"log"
-	"net/url"
 	"slices"
 	"sync"
-	"testing"
 	"time"
 
-	"github.com/matrix-org/policyserv/config"
-	"github.com/matrix-org/policyserv/filter/audit"
-	"github.com/matrix-org/policyserv/filter/classification"
-	"github.com/matrix-org/policyserv/filter/confidence"
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/matrix-org/policyserv/harms"
+	"github.com/matrix-org/policyserv/notifiers"
 )
 
 type auditContext struct {
-	Event              gomatrixserverlib.PDU
-	IsSpam             bool
-	FinalVectors       confidence.Vectors
-	IncrementalVectors []confidence.Vectors
-	FilterResponses    map[string][]classification.Classification
-	WebhookUrl         string
+	Event           gomatrixserverlib.PDU
+	IsSpam          bool
+	FilterResponses map[string][]string
+	CommunityId     string
 
-	lock           sync.Mutex // use a lock instead of a sync.Map because sync.Map doesn't support generics (and library support appears lacking in quality)
-	instanceConfig *config.InstanceConfig
+	lock     sync.Mutex // use a lock instead of a sync.Map because sync.Map doesn't support generics (and library support appears lacking in quality)
+	notifier notifiers.MatrixNotifier
 }
 
-func newAuditContext(instanceConfig *config.InstanceConfig, event gomatrixserverlib.PDU, webhookUrl string) (*auditContext, error) {
+func newAuditContext(notifier notifiers.MatrixNotifier, communityId string, event gomatrixserverlib.PDU) (*auditContext, error) {
 	return &auditContext{
-		Event:              event,
-		FilterResponses:    make(map[string][]classification.Classification),
-		IncrementalVectors: make([]confidence.Vectors, 0),
-		WebhookUrl:         webhookUrl,
+		Event:           event,
+		FilterResponses: make(map[string][]string),
+		CommunityId:     communityId,
 
 		// Populated later
-		IsSpam:       false,
-		FinalVectors: nil,
+		IsSpam: false,
 
 		// Internal
-		lock:           sync.Mutex{},
-		instanceConfig: instanceConfig,
+		lock:     sync.Mutex{},
+		notifier: notifier,
 	}, nil
 }
 
-func (c *auditContext) AppendFilterResponse(filterName string, classifications []classification.Classification) {
+func (c *auditContext) AppendFilterResponse(filterName string, contentInfo *harms.ContentInfo) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.FilterResponses[filterName] = classifications
+	c.FilterResponses[filterName] = []string{contentInfo.Class().String()}
+	for _, h := range contentInfo.Harms() {
+		c.FilterResponses[filterName] = append(c.FilterResponses[filterName], string(h))
+	}
 }
 
-func (c *auditContext) AppendSetGroupVectors(vectors confidence.Vectors) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	c.IncrementalVectors = append(c.IncrementalVectors, vectors)
-}
-
-func (c *auditContext) Publish(workQueue *audit.Queue) error {
+func (c *auditContext) Publish() error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -68,22 +57,8 @@ func (c *auditContext) Publish(workQueue *audit.Queue) error {
 	// have an idea of what happened.
 	log.Printf("[%s | %s | %s] Audit publish: %#v", c.Event.EventID(), c.Event.RoomID(), c.Event.SenderID(), c)
 
-	if c.WebhookUrl == "" || !c.IsSpam {
+	if !c.IsSpam {
 		return nil // nothing to publish
-	}
-
-	// Validate URL
-	whUrl, err := url.Parse(c.WebhookUrl)
-	if err != nil {
-		return err
-	}
-	if !testing.Testing() {
-		if whUrl.Scheme != "https" {
-			return fmt.Errorf("webhook URL must be HTTPS")
-		}
-	}
-	if !slices.Contains(c.instanceConfig.AllowedWebhookDomains, whUrl.Host) {
-		return fmt.Errorf("webhook URL host not allowed")
 	}
 
 	respsJson, err := json.MarshalIndent(c.FilterResponses, "", "  ")
@@ -97,7 +72,7 @@ func (c *auditContext) Publish(workQueue *audit.Queue) error {
 	}
 	contentJson := contentBuf.String()
 
-	wasHellban := c.FilterResponses[HellbanPrefilterName] != nil && slices.Contains(c.FilterResponses[HellbanPrefilterName], classification.Spam)
+	wasHellban := c.FilterResponses[HellbanPrefilterName] != nil && slices.Contains(c.FilterResponses[HellbanPrefilterName], string(harms.SpamGeneral))
 
 	htmlAudit := "A user has had an event of theirs flagged as spam by policyserv:<br/>"
 	htmlAudit += fmt.Sprintf("<b>User ID:</b> <code>%s</code><br/>", html.EscapeString(string(c.Event.SenderID())))
@@ -116,5 +91,15 @@ func (c *auditContext) Publish(workQueue *audit.Queue) error {
 		htmlAudit += "</details>" // close the details block from earlier
 	}
 
-	return workQueue.Submit(c.Event.EventID(), htmlAudit, whUrl.String())
+	// we don't html2text this because long events can cause hookshot to only show text versions, making all
+	// of our work to contain the spam to a <details> block useless. We still put some sort of message here
+	// though so clients which don't support HTML can still see something useful.
+	textAudit := "This event requires HTML."
+
+	msgId, err := c.notifier.Send(c.CommunityId, textAudit, htmlAudit)
+	if err != nil {
+		return fmt.Errorf("failed to send audit message: %w", err)
+	}
+	log.Printf("[%s | %s | %s] Audit message sent: %s", c.Event.EventID(), c.Event.RoomID(), c.Event.SenderID(), msgId)
+	return nil
 }

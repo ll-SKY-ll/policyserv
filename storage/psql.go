@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	cache "github.com/Code-Hex/go-generics-cache"
@@ -16,7 +17,7 @@ import (
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/gomatrixserverlib/spec"
 	"github.com/matrix-org/policyserv/config"
-	"github.com/matrix-org/policyserv/filter/confidence"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/metrics/dbmetrics"
 	"github.com/ryanuber/go-glob"
 	"golang.org/x/sync/singleflight"
@@ -279,22 +280,72 @@ func (s *PostgresStorage) GetEventResult(ctx context.Context, eventId string) (*
 		return nil, err
 	}
 
-	if encodedVectors != "" {
-		if err := json.Unmarshal([]byte(encodedVectors), &eventResult.ConfidenceVectors); err != nil {
-			return nil, err
-		}
-	} else {
-		eventResult.ConfidenceVectors = confidence.NewConfidenceVectors() // populate empty
+	if err := decodeEventResult(eventResult, encodedVectors); err != nil {
+		return nil, err
 	}
 
 	return eventResult, nil
+}
+
+func decodeEventResult(res *StoredEventResult, encodedVectors string) error {
+	if encodedVectors == "" {
+		encodedVectors = "{}" // simplifies JSON processing
+	}
+	decodedVectors := make(map[string]float64)
+	if err := json.Unmarshal([]byte(encodedVectors), &decodedVectors); err != nil {
+		return fmt.Errorf("failed to decode vectors: %w", err)
+	}
+
+	// Search for an explicit Allow vector
+	harmIds := make([]harms.Harm, 0)
+	for k, _ := range decodedVectors {
+		// Per UpsertEventResult, we encode the content class if it's allowed as a "vector". Neutral is never encoded,
+		// and prohibited is implied by the presence of harms (or other legacy vectors).
+		if k == harms.ContentClassAllowed.String() {
+			res.ContentInfo = harms.AllowedContent()
+			return nil
+		}
+
+		// TODO: We should probably do intelligent mapping of legacy vectors to harms. For now, we just namespace them.
+		if strings.HasPrefix(k, "h:") {
+			harmIds = append(harmIds, harms.Harm(k[2:]))
+		} else {
+			harmIds = append(harmIds, harms.Harm("org.matrix.policyserv.vec."+k))
+		}
+	}
+
+	// If the event was spammy, retain that status. Otherwise, the vectors are probably just debugging information
+	// left behind (like "spam: 0.5" on a Neutral event)
+	if res.IsProbablySpam {
+		res.ContentInfo = harms.ProhibitedContent(harmIds...)
+	} else {
+		res.ContentInfo = harms.NeutralContent()
+	}
+	return nil
 }
 
 func (s *PostgresStorage) UpsertEventResult(ctx context.Context, event *StoredEventResult) error {
 	t := dbmetrics.StartSelfDatabaseTimer("UpsertEventResult")
 	defer t.ObserveDuration()
 
-	encodedVectors, err := json.Marshal(event.ConfidenceVectors)
+	// Legacy code populated vectors as a map[string]float64, so for backwards compatibility we retain that.
+	decodedVectors := make(map[string]float64)
+	for _, h := range event.ContentInfo.Harms() {
+		// TODO: Like above, we should probably do intelligent mapping of legacy vectors to harms. For now, we just namespace them.
+		if strings.HasPrefix(string(h), "org.matrix.policyserv.vec.") {
+			// Retain namespace-free vectors in the database. This should only happen if we're updating an event
+			// result rather than on insert, but it's still possible.
+			decodedVectors[string(h)[len("org.matrix.policyserv.vec."):]] = 1.0
+		} else {
+			// Otherwise, prefix "new" harm IDs with `h:` so GetEventResult can find them.
+			decodedVectors["h:"+string(h)] = 1.0
+		}
+	}
+	if event.ContentInfo.Class() == harms.ContentClassAllowed {
+		decodedVectors[harms.ContentClassAllowed.String()] = 1.0
+	}
+
+	encodedVectors, err := json.Marshal(decodedVectors)
 	if err != nil {
 		return err
 	}

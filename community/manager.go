@@ -11,8 +11,9 @@ import (
 	"github.com/matrix-org/policyserv/config"
 	"github.com/matrix-org/policyserv/content"
 	"github.com/matrix-org/policyserv/filter"
-	"github.com/matrix-org/policyserv/filter/audit"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
+	"github.com/matrix-org/policyserv/notifiers"
 	"github.com/matrix-org/policyserv/pubsub"
 	"github.com/matrix-org/policyserv/storage"
 )
@@ -23,11 +24,11 @@ type Manager struct {
 	roomToCommunityCache *cache.Cache[string, string]      // room ID -> community ID
 	instanceConfig       *config.InstanceConfig
 	pubsubClient         pubsub.Client
-	auditQueue           *audit.Queue
+	notifier             notifiers.MatrixNotifier
 	localAIScannerDefs   []content.LocalAIScannerDef // parsed once at startup
 }
 
-func NewManager(instanceConfig *config.InstanceConfig, storage storage.PersistentStorage, pubsubClient pubsub.Client, auditQueue *audit.Queue) (*Manager, error) {
+func NewManager(instanceConfig *config.InstanceConfig, storage storage.PersistentStorage, pubsubClient pubsub.Client, notifier notifiers.MatrixNotifier) (*Manager, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -38,7 +39,7 @@ func NewManager(instanceConfig *config.InstanceConfig, storage storage.Persisten
 	}
 	if len(scannerDefs) > 0 {
 		for _, def := range scannerDefs {
-			log.Printf("Registered local AI scanner: type=%s url=%s", def.Type, def.Url)
+			log.Printf("Registered local AI scanner: type=%s url=%s harms=%v", def.Type, def.Url, def.Harms)
 		}
 	}
 
@@ -70,7 +71,7 @@ func NewManager(instanceConfig *config.InstanceConfig, storage storage.Persisten
 		roomToCommunityCache: roomIdCache,
 		instanceConfig:       instanceConfig,
 		pubsubClient:         pubsubClient,
-		auditQueue:           auditQueue,
+		notifier:             notifier,
 		localAIScannerDefs:   scannerDefs,
 	}, nil
 }
@@ -110,7 +111,8 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	prefilters := []string{filter.ProtectLocalUserFilterName}
 	hellbanPrefilters := make([]string, 0) // these run after the prefilters, but before the other filters
 	filters := make([]string, 0)
-	postfilters := make([]string, 0)
+	postfilterSilences := make([]string, 0)
+	mutedRoomsFilters := make([]string, 0) // these run last, after the hellban postfilter - see filter_muted_rooms.go
 	if len(internal.Dereference(communityConfig.KeywordFilterKeywords)) > 0 {
 		filters = append(filters, filter.KeywordFilterName)
 	}
@@ -152,7 +154,7 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 	}
 	if internal.Dereference(communityConfig.HellbanPostfilterMinutes) > 0 {
 		hellbanPrefilters = append(hellbanPrefilters, filter.HellbanPrefilterName)
-		postfilters = append(postfilters, filter.HellbanPostfilterName)
+		postfilterSilences = append(postfilterSilences, filter.HellbanPostfilterName)
 	}
 	if m.instanceConfig.OpenAIApiKey != "" {
 		// Access to this filter is gated by further instance config (namely, the room IDs allowed to use it)
@@ -180,8 +182,7 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 		filters = append(filters, filter.ForbiddenUserIdFilterName)
 	}
 	if len(internal.Dereference(communityConfig.MutedRoomsFilterRoomIds)) > 0 {
-		// Deliberately a postfilter rather than a prefilter - see the developer note in filter_muted_rooms.go for why.
-		postfilters = append(postfilters, filter.MutedRoomsFilterName)
+		mutedRoomsFilters = append(mutedRoomsFilters, filter.MutedRoomsFilterName)
 	}
 
 	var scanners []content.Scanner
@@ -197,23 +198,23 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 
 	// Local AI image scanners — match community-requested types against instance-available types
 	if communityConfig.LocalAIScannerConfigs != nil && len(*communityConfig.LocalAIScannerConfigs) > 0 {
-		// Build a lookup of available scanner URLs by type
-		availableScanners := make(map[string]string) // type -> url
+		// Build a lookup of available scanners by type
+		availableScanners := make(map[string]content.LocalAIScannerDef) // type -> def
 		for _, def := range m.localAIScannerDefs {
-			availableScanners[def.Type] = def.Url
+			availableScanners[def.Type] = def
 		}
 
 		for _, commScanner := range *communityConfig.LocalAIScannerConfigs {
-			url, available := availableScanners[commScanner.Type]
+			def, available := availableScanners[commScanner.Type]
 			if !available {
 				log.Printf("[%s] Community requested scanner type %q but it is not available at instance level, skipping", communityId, commScanner.Type)
 				continue
 			}
-			localAI, err := content.NewLocalAIScanner(commScanner.Type, url, commScanner.Threshold)
+			localAI, err := content.NewLocalAIScanner(commScanner.Type, def.Url, commScanner.Threshold, def.Harms)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create local AI scanner type %q: %w", commScanner.Type, err)
 			}
-			log.Printf("[%s] Enabled local AI scanner: type=%s url=%s threshold=%.2f", communityId, commScanner.Type, url, commScanner.Threshold)
+			log.Printf("[%s] Enabled local AI scanner: type=%s url=%s threshold=%.2f", communityId, commScanner.Type, def.Url, commScanner.Threshold)
 			scanners = append(scanners, localAI)
 		}
 	}
@@ -233,37 +234,39 @@ func (m *Manager) GetFilterSetForCommunityId(ctx context.Context, communityId st
 		InstanceConfig:  m.instanceConfig,
 		Groups: []*filter.SetGroupConfig{{
 			// The first set group replaces the concept of "prefilters". We want this group to capture all events,
-			// so we set the min and max to cover the full range.
-			EnabledNames:           prefilters,
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			// so we set the classes appropriately.
+			EnabledNames: prefilters,
+			// Micro optimization: Put neutral first so we can skip CPU cycles in a loop in the general case. We also
+			// probably don't need to specify allowed and prohibited here because we have no code which pushes such
+			// classes right away, but for safety we might as well.
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral, harms.ContentClassAllowed, harms.ContentClassProhibited},
 		}, {
 			// This set group is similar to prefilters, but only contains the hellban prefilters. This is to prevent
 			// users being denied abilities that are intended to be granted to them via other prefilters (like an
 			// ability to leave the room).
 			EnabledNames: hellbanPrefilters,
-			// We want the min/max values to catch "maybe spam" from the prefilters level, but explicitly not events
-			// that were flagged as not-spam by the same layer. This is why the minimum is not quite zero.
-			MinimumSpamVectorValue: 0.1,
-			MaximumSpamVectorValue: 1.0,
+			// We want to capture "maybe spam", but not events that were already flagged as (not) spam.
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral},
 		}, {
 			// The third set group is what was previously the middle layer for filters. This is where the bulk of
 			// the work happens. We only want it to run if the prefilters didn't already declare an event spammy or
 			// neutral though, so we narrow the min/max range a bit.
 			EnabledNames: filters,
-			// We want the min/max to be slightly less than the extremes to avoid doing work
-			// when the event is already flagged as (not) spam.
-			MinimumSpamVectorValue: 0.3,
-			MaximumSpamVectorValue: 0.7,
+			// Skip this group for events that are already (not) spam.
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral},
 		}, {
-			// The last set group replaces "postfilters", and should be run regardless of whether the previous groups
-			// flagged the event as spam. As such, we set the min/max to the widest possible range.
-			EnabledNames:           postfilters,
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			// The last set group is for telling the hellban postfilter if any previous filter flagged an event as
+			// spammy so it can put a silence in place.
+			EnabledNames:          postfilterSilences,
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited},
+		}, {
+			// Muted rooms run after the hellban postfilter so a mute can never trigger a hellban. Allowed content is
+			// checked too, so the sender/event type allowlists can't bypass a mute.
+			EnabledNames:          mutedRoomsFilters,
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral, harms.ContentClassAllowed},
 		}},
 	}
-	filterSet, err := filter.NewSet(setConfig, m.storage, m.pubsubClient, m.auditQueue, scanner)
+	filterSet, err := filter.NewSet(setConfig, m.storage, m.pubsubClient, m.notifier, scanner)
 	if err != nil {
 		return nil, err
 	}

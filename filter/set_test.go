@@ -7,25 +7,50 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/policyserv/config"
-	"github.com/matrix-org/policyserv/filter/classification"
-	"github.com/matrix-org/policyserv/filter/confidence"
+	"github.com/matrix-org/policyserv/harms"
 	"github.com/matrix-org/policyserv/internal"
 	"github.com/matrix-org/policyserv/media"
+	"github.com/matrix-org/policyserv/notifiers"
+	"github.com/matrix-org/policyserv/storage"
 	"github.com/matrix-org/policyserv/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/tidwall/gjson"
 )
+
+func AssertCheckEvent(t *testing.T, set *Set, event gomatrixserverlib.PDU, expected *harms.ContentInfo) {
+	AssertCheckEventWithDownloader(t, set, event, expected, nil)
+}
+
+func AssertCheckEventWithDownloader(t *testing.T, set *Set, event gomatrixserverlib.PDU, expected *harms.ContentInfo, downloader media.Downloader) {
+	info, err := set.CheckEvent(context.Background(), event, downloader)
+	assert.NoError(t, err)
+	test.AssertEqualContentInfo(t, expected, info)
+}
+
+func AssertCheckText(t *testing.T, set *Set, eventWithBody gomatrixserverlib.PDU, expected *harms.ContentInfo) {
+	body := gjson.Get(string(eventWithBody.Content()), "body").String()
+	info, err := set.CheckText(context.Background(), body)
+	assert.NoError(t, err)
+	test.AssertEqualContentInfo(t, expected, info)
+}
+
+func AssertCheckTextAndEvent(t *testing.T, set *Set, eventWithBody gomatrixserverlib.PDU, expected *harms.ContentInfo) {
+	AssertCheckText(t, set, eventWithBody, expected)
+	AssertCheckEvent(t, set, eventWithBody, expected)
+}
 
 func TestNewSet(t *testing.T) {
 	cnf := &SetConfig{
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0.3,
-			MaximumSpamVectorValue: 0.8,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything is neutral by default in the test
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
@@ -33,11 +58,9 @@ func TestNewSet(t *testing.T) {
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
-
-	assert.Equal(t, set.GetStorage(), memStorage)
 
 	assert.Equal(t, len(cnf.Groups), len(set.groups))
 	assert.Equal(t, len(cnf.Groups[0].EnabledNames), len(set.groups[0].filters))
@@ -51,9 +74,8 @@ func TestNewSet(t *testing.T) {
 func TestNewSetUnknownFilter(t *testing.T) {
 	cnf := &SetConfig{
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{"this_is_not_a_real_filter_name"},
-			MinimumSpamVectorValue: 0.3,
-			MaximumSpamVectorValue: 0.8,
+			EnabledNames:          []string{"this_is_not_a_real_filter_name"},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything is neutral by default in the test
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
@@ -61,7 +83,7 @@ func TestNewSetUnknownFilter(t *testing.T) {
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.ErrorContains(t, err, "error finding filter name")
 	assert.Nil(t, set)
 }
@@ -69,9 +91,8 @@ func TestNewSetUnknownFilter(t *testing.T) {
 func TestNewSetErrorMaking(t *testing.T) {
 	cnf := &SetConfig{
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{ErrorFilterName},
-			MinimumSpamVectorValue: 0.3,
-			MaximumSpamVectorValue: 0.8,
+			EnabledNames:          []string{ErrorFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything is neutral by default in the test
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
@@ -79,7 +100,7 @@ func TestNewSetErrorMaking(t *testing.T) {
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.ErrorContains(t, err, "error making filter")
 	assert.Nil(t, set)
 }
@@ -89,20 +110,18 @@ func TestSetCheckEvent(t *testing.T) {
 		CommunityConfig: &config.CommunityConfig{},
 		// We want to ensure we call *all* groups, so specify 2 to call
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // events start off neutral by default
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // we're going to test that harms are added
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 
@@ -113,61 +132,39 @@ func TestSetCheckEvent(t *testing.T) {
 	f2.T = t
 
 	// Set our expectations and return values
-	// Note: internally, sets start with a 0.5 spam vector, so things get divided by 3 rather than 2
 	event := test.MustMakePDU(&test.BaseClientEvent{
 		RoomId:  "!foo:example.org",
 		EventId: "$test",
 		Type:    "m.room.message",
 		Content: make(map[string]any),
 	})
-	f1.Expect = &EventInput{Event: event, Medias: make([]*media.Item, 0), IncrementalConfidenceVectors: confidence.Vectors{
-		classification.Spam: 0.5,
-	}}
-	f1.ReturnClasses = []classification.Classification{
-		classification.Spam,
-		classification.Mentions,
-	}
-	f2.Expect = &EventInput{Event: event, Medias: make([]*media.Item, 0), IncrementalConfidenceVectors: confidence.Vectors{
-		classification.Spam:     1.0,
-		classification.Mentions: 1.0,
-	}}
-	f2.ReturnClasses = []classification.Classification{
-		classification.Spam.Invert(),
-		classification.Volumetric,
-	}
+	f1.Expect = &EventInput{Event: event, Medias: make([]*media.Item, 0)}
+	f2.Expect = f1.Expect // same input
+	f1.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
+	f2.ReturnInfo = harms.ProhibitedContent(harms.SpamFraud) // this should be added on after the filters run
 
-	vecs, err := set.CheckEvent(context.Background(), event, nil)
-	assert.NoError(t, err)
-	assert.NotNil(t, vecs)
-	assert.Equal(t, confidence.Vectors{
-		classification.Spam:       1.0,
-		classification.Mentions:   1.0,
-		classification.Volumetric: 1.0,
-	}, vecs)
+	AssertCheckEvent(t, set, event, harms.ProhibitedContent(harms.SpamFlooding, harms.SpamFraud))
 }
 
 func TestCheckEventWithErrorInGroup(t *testing.T) {
 	cnf := &SetConfig{
 		CommunityConfig: &config.CommunityConfig{},
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // events start off neutral by default
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // our fixed filter sets everything as prohibited
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // our fixed filter sets everything as prohibited
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 
@@ -181,15 +178,9 @@ func TestCheckEventWithErrorInGroup(t *testing.T) {
 		{
 			Event:  event,
 			Medias: make([]*media.Item, 0),
-			IncrementalConfidenceVectors: confidence.Vectors{
-				classification.Spam: 0.5,
-			},
 		}, {
 			Event:  event,
 			Medias: make([]*media.Item, 0),
-			IncrementalConfidenceVectors: confidence.Vectors{
-				classification.Spam: 1.0, // group 0 result
-			},
 		},
 		nil, // should never be called
 	}
@@ -198,13 +189,13 @@ func TestCheckEventWithErrorInGroup(t *testing.T) {
 		for _, f := range group.filters {
 			ff := f.(*FixedInstancedFilter)
 			ff.T = t
-			ff.ReturnClasses = []classification.Classification{classification.Spam}
+			ff.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
 			ff.Expect = inputs[i]
 		}
 	}
 	errorFilter := set.groups[1].filters[0].(*FixedInstancedFilter)
 	errorFilter.ReturnErr = errors.New("error within filter group")
-	errorFilter.ReturnClasses = nil
+	errorFilter.ReturnInfo = nil
 
 	vecs, err := set.CheckEvent(context.Background(), event, nil)
 	assert.ErrorContains(t, err, "error at group 1")
@@ -216,20 +207,18 @@ func TestSetCheckText(t *testing.T) {
 		CommunityConfig: &config.CommunityConfig{},
 		// We want to ensure we call *all* groups, so specify 2 to call
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // content start off neutral by default
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // we're going to test that harms are added
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 
@@ -240,50 +229,35 @@ func TestSetCheckText(t *testing.T) {
 	f2.T = t
 
 	// Set our expectations and return values
-	// Note: internally, sets start with a 0.5 spam vector, so things get divided by 3 rather than 2
 	f1.ExpectText = "Hello world"
 	f2.ExpectText = "Hello world"
-	f1.ReturnClasses = []classification.Classification{
-		classification.Spam,
-		classification.Mentions,
-	}
-	f2.ReturnClasses = []classification.Classification{
-		classification.Spam.Invert(),
-		classification.Volumetric,
-	}
+	f1.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
+	f2.ReturnInfo = harms.ProhibitedContent(harms.SpamFraud) // this should be added on after the filters run
 
-	vecs, err := set.CheckText(context.Background(), "Hello world")
+	info, err := set.CheckText(context.Background(), "Hello world")
 	assert.NoError(t, err)
-	assert.NotNil(t, vecs)
-	assert.Equal(t, confidence.Vectors{
-		classification.Spam:       1.0,
-		classification.Mentions:   1.0,
-		classification.Volumetric: 1.0,
-	}, vecs)
+	test.AssertEqualContentInfo(t, harms.ProhibitedContent(harms.SpamFlooding, harms.SpamFraud), info)
 }
 
 func TestSetCheckTextWithErrorInGroup(t *testing.T) {
 	cnf := &SetConfig{
 		CommunityConfig: &config.CommunityConfig{},
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // events start off neutral by default
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // our fixed filter sets everything as prohibited
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassProhibited}, // our fixed filter sets everything as prohibited
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 
@@ -291,7 +265,7 @@ func TestSetCheckTextWithErrorInGroup(t *testing.T) {
 		for _, f := range group.filters {
 			ff := f.(*FixedInstancedFilter)
 			ff.T = t
-			ff.ReturnClasses = []classification.Classification{classification.Spam}
+			ff.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
 			if i > 1 {
 				ff.ReturnErr = errors.New("should never happen")
 				ff.ExpectText = "if you see this in the test output, it broke"
@@ -302,43 +276,11 @@ func TestSetCheckTextWithErrorInGroup(t *testing.T) {
 	}
 	errorFilter := set.groups[1].filters[0].(*FixedInstancedFilter)
 	errorFilter.ReturnErr = errors.New("error within filter group")
-	errorFilter.ReturnClasses = nil
+	errorFilter.ReturnInfo = nil
 
 	vecs, err := set.CheckText(context.Background(), "Hello world")
 	assert.ErrorContains(t, err, "error at group 1")
 	assert.Nil(t, vecs)
-}
-
-func TestSetSpamThreshold(t *testing.T) {
-	cnf := &SetConfig{
-		CommunityConfig: &config.CommunityConfig{
-			SpamThreshold: internal.Pointer(0.6),
-		},
-	}
-	memStorage := test.NewMemoryStorage(t)
-	defer memStorage.Close()
-	ps := test.NewMemoryPubsub(t)
-	defer ps.Close()
-
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
-	assert.NoError(t, err)
-	assert.NotNil(t, set)
-
-	assert.Equal(t, true, set.IsSpamResponse(context.Background(), confidence.Vectors{
-		classification.Spam: 0.6, // exact match
-	}))
-	assert.Equal(t, true, set.IsSpamResponse(context.Background(), confidence.Vectors{
-		classification.Spam: 0.7, // just above
-	}))
-	assert.Equal(t, false, set.IsSpamResponse(context.Background(), confidence.Vectors{
-		classification.Spam: 0.5, // just below
-	}))
-	assert.Equal(t, false, set.IsSpamResponse(context.Background(), confidence.Vectors{
-		classification.Spam: 0.0, // very much below
-	}))
-	assert.Equal(t, true, set.IsSpamResponse(context.Background(), confidence.Vectors{
-		classification.Spam: 1.0, // very much above
-	}))
 }
 
 func TestCallsWebhook(t *testing.T) {
@@ -367,33 +309,39 @@ func TestCallsWebhook(t *testing.T) {
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
+	parsedUrl, err := url.Parse(server.URL)
+	assert.NoError(t, err)
 
 	cnf := &SetConfig{
 		CommunityConfig: &config.CommunityConfig{
-			SpamThreshold: internal.Pointer(0.6),
-			WebhookUrl:    internal.Pointer(server.URL + "/webhook"),
+			WebhookUrl: internal.Pointer(server.URL + "/webhook"),
 		},
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // starts as neutral, stays neutral until the next filter runs
 		}, {
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral},
 		}},
-		InstanceConfig: &config.InstanceConfig{
-			AllowedWebhookDomains: []string{server.Listener.Addr().String()},
-		},
 	}
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	notifier, err := notifiers.NewWebhookMatrixNotifier(memStorage, 5, []string{parsedUrl.Host})
+	assert.NoError(t, err)
+	assert.NotNil(t, notifier)
+	set, err := NewSet(cnf, memStorage, ps, notifier, nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
+
+	// Insert the community so the notifier works
+	err = memStorage.UpsertCommunity(context.Background(), &storage.StoredCommunity{
+		CommunityId: set.communityId,
+		Config:      set.communityConfig,
+	})
+	assert.NoError(t, err)
 
 	event := test.MustMakePDU(&test.BaseClientEvent{
 		RoomId:  "!foo:example.org",
@@ -407,28 +355,26 @@ func TestCallsWebhook(t *testing.T) {
 	})
 
 	// The first group returns a neutral response and the second group returns spam. This is to ensure that the resulting
-	// webhook shows the groups independently. This also makes writing the test easier because both groups will receive
-	// the same initial (incremental) vectors.
+	// webhook shows the groups independently.
 
 	for i := 0; i < 2; i++ {
 		fixedFilter := set.groups[i].filters[0].(*FixedInstancedFilter)
 		fixedFilter.T = t
 		fixedFilter.Set = set
 		fixedFilter.Expect = &EventInput{
-			Event:                        event,
-			Medias:                       make([]*media.Item, 0),
-			IncrementalConfidenceVectors: confidence.Vectors{classification.Spam: 0.5},
+			Event:  event,
+			Medias: make([]*media.Item, 0),
 		}
-		fixedFilter.ReturnClasses = []classification.Classification{}
+		fixedFilter.ReturnInfo = harms.NeutralContent()
 
 		if i > 0 {
-			fixedFilter.ReturnClasses = append(fixedFilter.ReturnClasses, classification.Spam, classification.Mentions)
+			fixedFilter.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
 		}
 	}
 
-	vecs, err := set.CheckEvent(context.Background(), event, nil)
+	info, err := set.CheckEvent(context.Background(), event, nil)
 	assert.NoError(t, err)
-	assert.NotNil(t, vecs) // composition checked in other tests
+	assert.NotNil(t, info) // composition checked in other tests
 
 	// Wait a bit so the goroutines can settle
 	time.Sleep(1 * time.Second)
@@ -452,29 +398,36 @@ func TestCallsWebhookErrorNonFatal(t *testing.T) {
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
+	parsedUrl, err := url.Parse(server.URL)
+	assert.NoError(t, err)
 
 	cnf := &SetConfig{
 		CommunityConfig: &config.CommunityConfig{
-			SpamThreshold: internal.Pointer(0.6),
-			WebhookUrl:    internal.Pointer(server.URL + "/webhook"),
+			WebhookUrl: internal.Pointer(server.URL + "/webhook"),
 		},
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything starts as neutral
 		}},
-		InstanceConfig: &config.InstanceConfig{
-			AllowedWebhookDomains: []string{server.Listener.Addr().String()},
-		},
 	}
 	memStorage := test.NewMemoryStorage(t)
 	defer memStorage.Close()
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	notifier, err := notifiers.NewWebhookMatrixNotifier(memStorage, 5, []string{parsedUrl.Host})
+	assert.NoError(t, err)
+	assert.NotNil(t, notifier)
+	set, err := NewSet(cnf, memStorage, ps, notifier, nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
+
+	// Insert the community so the notifier works
+	err = memStorage.UpsertCommunity(context.Background(), &storage.StoredCommunity{
+		CommunityId: set.communityId,
+		Config:      set.communityConfig,
+	})
+	assert.NoError(t, err)
 
 	event := test.MustMakePDU(&test.BaseClientEvent{
 		RoomId:  "!foo:example.org",
@@ -491,11 +444,10 @@ func TestCallsWebhookErrorNonFatal(t *testing.T) {
 	fixedFilter.T = t
 	fixedFilter.Set = set
 	fixedFilter.Expect = &EventInput{
-		Event:                        event,
-		Medias:                       make([]*media.Item, 0),
-		IncrementalConfidenceVectors: confidence.Vectors{classification.Spam: 0.5},
+		Event:  event,
+		Medias: make([]*media.Item, 0),
 	}
-	fixedFilter.ReturnClasses = []classification.Classification{classification.Spam}
+	fixedFilter.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
 
 	vecs, err := set.CheckEvent(context.Background(), event, nil)
 	assert.NoError(t, err)
@@ -516,9 +468,8 @@ func TestExtractsMedia(t *testing.T) {
 	cnf := &SetConfig{
 		CommunityConfig: &config.CommunityConfig{},
 		Groups: []*SetGroupConfig{{
-			EnabledNames:           []string{FixedFilterName},
-			MinimumSpamVectorValue: 0.0,
-			MaximumSpamVectorValue: 1.0,
+			EnabledNames:          []string{FixedFilterName},
+			CheckedContentClasses: []harms.ContentClass{harms.ContentClassNeutral}, // everything starts as neutral
 		}},
 	}
 	memStorage := test.NewMemoryStorage(t)
@@ -526,7 +477,7 @@ func TestExtractsMedia(t *testing.T) {
 	ps := test.NewMemoryPubsub(t)
 	defer ps.Close()
 
-	set, err := NewSet(cnf, memStorage, ps, test.MustMakeAuditQueue(5), nil)
+	set, err := NewSet(cnf, memStorage, ps, test.NewMatrixNotifier(t), nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, set)
 
@@ -554,8 +505,7 @@ func TestExtractsMedia(t *testing.T) {
 	fixedFilter.T = t
 	fixedFilter.Set = set
 	fixedFilter.Expect = &EventInput{
-		Event:                        event,
-		IncrementalConfidenceVectors: confidence.Vectors{classification.Spam: 0.5},
+		Event: event,
 		Medias: []*media.Item{
 			{
 				Origin:  origin1,
@@ -567,7 +517,7 @@ func TestExtractsMedia(t *testing.T) {
 			},
 		},
 	}
-	fixedFilter.ReturnClasses = []classification.Classification{classification.Spam}
+	fixedFilter.ReturnInfo = harms.ProhibitedContent(harms.SpamFlooding)
 
 	res, err := set.CheckEvent(context.Background(), event, downloader)
 	assert.NoError(t, err)
@@ -575,9 +525,8 @@ func TestExtractsMedia(t *testing.T) {
 
 	// Now test that there are no media items extracted when no downloader is supplied.
 	fixedFilter.Expect = &EventInput{
-		Event:                        event,
-		IncrementalConfidenceVectors: confidence.Vectors{classification.Spam: 0.5},
-		Medias:                       make([]*media.Item, 0),
+		Event:  event,
+		Medias: make([]*media.Item, 0),
 	}
 	res, err = set.CheckEvent(context.Background(), event, nil)
 	assert.NoError(t, err)
